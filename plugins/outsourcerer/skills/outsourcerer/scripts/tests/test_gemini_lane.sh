@@ -62,7 +62,7 @@ _agy_effort gemini-3.1-pro medium 2>&1 >/dev/null | grep -q 'has no' \
 grep -q -- '--effort "\$aeff"' "$SRC" \
   && ok "the agy invocation passes --effort (it refuses to run without one)" \
   || bad "agy is still invoked without --effort"
-awk '/vehicle" = "agy"/,/record_ledger antigravity-agy/' "$SRC" | grep -q -- '--model "\$atok"' \
+grep -qF -- '--model "$atok"' <<<"$(awk '/vehicle" = "agy"/,/record_ledger antigravity-agy/' "$SRC")" \
   && ok "the agy invocation passes an explicit --model" || bad "agy invoked without --model"
 
 # --- installed is not ready ---
@@ -83,7 +83,7 @@ grep -q 'accepted the request and never answered' "$SRC" \
 grep -q 'OSRC_AGY_PRINT_TIMEOUT=%s was the wait' "$SRC" \
   && ok "the message names the knob that controls how long it waited" \
   || bad "no way for the user to fail faster on an unhealthy lane"
-awk '/timeout waiting for response/,/rm -f "\$_aerr"/' "$SRC" | grep -q 'rc=124' \
+grep -qF 'rc=124' <<<"$(awk '/timeout waiting for response/,/rm -f "\$_aerr"/' "$SRC")" \
   && ok "a lane that never answered exits non-zero (never mistaken for success)" \
   || bad "an unanswered request could still exit 0"
 

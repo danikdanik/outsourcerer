@@ -213,7 +213,7 @@ Under the robe it's deliberately boring: a self-contained bash script you can re
 
 Outsourcerer runs the whole summoning itself. It decides what to delegate, picks the lane and model on live benchmarks, keeps every delegate interactive and steerable, supervises the fleet, and refuses to end a turn while work is live and waiting on you. The orchestrator contract lives in the skill, so the session you talk to owns the plan and the outcome rather than handing choices back to you.
 
-**It also works underneath an orchestrator you already have.** Point yours at Outsourcerer and keep it: your orchestrator decides what to delegate and how results get approved, and Outsourcerer runs the assignments. It dispatches each specialist across any provider, supervises them, tracks the spend, and hands the results back as parsable state. One dependable dispatch layer, whoever is casting.
+**It also works underneath an orchestrator you already have.** Point yours at Outsourcerer and keep it: your orchestrator decides what to delegate and how results get approved, and Outsourcerer runs the assignments. It dispatches each specialist across any provider, then watchdog-supervises every job through to a **classified** end (done / blocked / timed-out) instead of a silent exit, salvages the recoverable ones with a bounded verify→retry loop, tracks the spend, and hands the results back as parsable state. Not just a router: a layer that dispatches, verifies, and accounts for every delegate, whoever is casting.
 
 **Point it at any agent library and it just works.** A folder of role definitions, your own or a library like [agency-agents](https://github.com/msitarzewski/agency-agents), runs as a squad with `fanout --agents ./crew`, one supervised job per specialist. You never have to edit those files. The whole crew runs on a sensible cheap lane by default, and you add routing only if you want it, three ways, editing files last:
 
@@ -251,7 +251,7 @@ outsourcerer fleet show <id>
 
 **Real names, not hashes.** `fleet name` reads what each session is actually working on and names it, so `session-71` reads as `Refactor the auth retry path`, cached so the list stays instant.
 
-**It catches the stuck ones.** Turn on supervision and a background heartbeat watches the fleet, spots a delegate that stalled or never started, and steps in instead of letting it sit silent for half an hour.
+**It catches the stuck ones, and it reaches you.** Turn on supervision and a background heartbeat watches the fleet, spots a delegate that stalled, never started, or drifted off its pinned model, and either bounds it or **wakes you** through a notifier you set (`OSRC_HEARTBEAT_WAKE`) instead of letting it sit silent for half an hour. The heartbeat verifies its own liveness: it reports itself **armed** only when a real watcher is proven running by pid and start-time, and says so loudly when it is not, so "supervised" never quietly means "unwatched".
 
 Today it covers your Claude Code sessions and the jobs Outsourcerer runs. Seeing sessions other tools launched on their own is next.
 

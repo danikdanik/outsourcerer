@@ -2,6 +2,41 @@
 
 All notable changes to the Outsourcerer plugin are documented here.
 
+## 0.11.1
+
+### Fixed
+
+- **Conformance no longer fails on Linux CI for `test_gemini_lane` and `test_watcher` (false failures).** Several source-inspection assertions ran `awk '/start/,/end/' "$SRC" | grep -q PATTERN` under `set -o pipefail`. `grep -q` exits on the first match and closes the pipe, so `awk` takes a `SIGPIPE` (exit 141); `pipefail` then promotes that to a pipeline failure — but only where the writer is still running when `grep` closes, which is Linux's process timing, not macOS's. The assertions therefore reported the pattern "not found" (e.g. "agy invoked without --model", "background launch does not auto-arm heartbeat") on ubuntu while passing on macOS. Fixed by removing the pipe: the `awk` output is captured and fed to `grep -qF` via a here-string, so `grep`'s own exit status is the verdict and no `SIGPIPE` can taint it. Verified green in a real ubuntu container and on macOS.
+
+### Changed
+
+- **Version sync.** `OSRC_VERSION` in the script had lagged at `0.10.5` while `plugin.json` was `0.11.0`; both now read `0.11.1`, so `doctor`'s drift check is clean. A new `test_version_parity.sh` (adapted from a contribution by @danikdanik) asserts the two copies match, so this can't silently drift again.
+- **README.** The "bring your own orchestrator" section now names the verification + lifecycle layer (classified job ends, bounded verify→retry) instead of reading as pure routing, and the fleet-supervision line documents the heartbeat wake (`OSRC_HEARTBEAT_WAKE`) and the arm-liveness gate.
+
+## 0.11.0
+
+### Hardened (supervision liveness)
+
+- **A session can no longer claim supervision is "armed" over a dead or mismatched watcher.** An arm-verify gate now binds every `armed` claim to a live beacon by pid + process-start time + beacon argv identity + a per-arm token; it re-arms once and otherwise renders a loud `NOT-ARMED` rather than a false green. Arming happens automatically on `bg`/`fanout`/`session`, and the real `heartbeat start` command and `fleet supervise` route through the same gate.
+- **Unreaped zombie leaders no longer wedge the fleet.** A leader in `ps` state `Z` is rejected and evicted, so supervision recovers instead of hanging behind a defunct process.
+- **The `NOT-ARMED` state is now durable and self-clearing.** A per-job marker is written when arming fails, re-evaluated on each render, and cleared only by a later successful arm (with winpty parity on Windows).
+- **Stale-session detection survives an acknowledgement.** The stale-session alarm re-fires after an ack on an otherwise quiescent fleet; the wake-queue and ack reads now happen under the state lock (no lost wakes), and an ownerless mkdir-election directory is stale-broken.
+
+### Fixed
+
+- **`session start` no longer dies with a bogus "model token is empty" for override-less lanes.** Interactive CLIs that carry no model override (droid/cursor/warp/hermes/cline) start cleanly; the `codex-session` model is optional too.
+- **Devin interactive sessions no longer silently drop `--effort`.** When effort is requested but the TUI would ignore it, the lane now warns loudly instead of running the default in silence — effort is never dropped without a word.
+- **The long-standing "CI red on 6 suites" is fixed.** The conformance runner now gives each unit suite a fresh `OSRC_HOME`, so one suite's jobs/sessions/locks/registry state can no longer perturb later tmux/session-heavy suites; six suites that passed standalone but failed in aggregate now pass together. `test_tier_churn` is registered so the never-run-suite guard passes, and a fake-CLI arg was renamed (`no-flag` → `noflag`) to clear a subshell-counter lint false positive (behavior unchanged).
+
+### Changed (churn-proof routing)
+
+- **Model tiering no longer needs a table edit for every new family.** `tier_from_name` lets a size suffix outrank the family and uses version-agnostic globs, so a newly released family tiers correctly on its own; an effort floor is applied for models that reject `none`/`minimal`, and the frontier scaffold gained a finish clause.
+- **Conserve mode and lane scoring bind to the more-spent of the 5h and weekly plan windows**, so routing protects whichever limit is closer to the edge.
+
+### Tests
+
+- 6 new heartbeat/liveness suites (arm-liveness, autoarm, ownership, rearm-command, stale-alarm, tier-churn) — 68 new assertions. No new conformance regressions.
+
 ## 0.10.6
 
 ### Fixed

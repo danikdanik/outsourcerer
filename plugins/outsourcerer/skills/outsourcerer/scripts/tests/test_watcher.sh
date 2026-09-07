@@ -67,13 +67,13 @@ grep -q 'NOW WATCH IT' "$SRC" \
 
 # --- the commands that mean 'someone looked' must record it, or the warning never clears ---
 for c in cmd_status cmd_watch cmd_result; do
-  awk "/^$c\(\) \{/,/_mark_watched/" "$SRC" | grep -q '_mark_watched' \
+  grep -qF '_mark_watched' <<<"$(awk "/^$c\(\) \{/,/_mark_watched/" "$SRC")" \
     && ok "$c records that the job was observed" \
     || bad "$c does not record attention (warning would never clear)"
 done
 
 # --- a detached worker must not warn about itself: it IS the work ---
-awk '/Surface neglected jobs on EVERY invocation/,/esac/' "$SRC" | grep -q '__runjob' \
+grep -qF '__runjob' <<<"$(awk '/Surface neglected jobs on EVERY invocation/,/esac/' "$SRC")" \
   && ok "the detached job process is exempt from its own warning" \
   || bad "a running job would warn about itself"
 
@@ -112,14 +112,14 @@ pending="$(_wake_drain)"
 rm -rf "$HB_TMP"
 OSRC_HOME="$old_home"
 
-awk '/^_bg_launch\(\)/,/^}/' "$SRC" | grep -q '_heartbeat_arm_verify' \
-  && awk '/^_heartbeat_arm_verify\(\)/,/^}/' "$SRC" | grep -q '_heartbeat_start' \
+grep -qF '_heartbeat_arm_verify' <<<"$(awk '/^_bg_launch\(\)/,/^}/' "$SRC")" \
+  && grep -qF '_heartbeat_start' <<<"$(awk '/^_heartbeat_arm_verify\(\)/,/^}/' "$SRC")" \
   && ok "successful background launches auto-arm heartbeat (verified via _heartbeat_arm_verify)" \
   || bad "background launch does not auto-arm heartbeat"
-if grep -q '_session_launch_finalize "\$_ad_sess"' "$SRC" \
-   && grep -q '_session_launch_finalize "\$SESSION_NAME"' "$SRC" \
-   && grep -q '_session_launch_finalize "\$pane"' "$SRC" \
-   && awk '/^_session_launch_finalize\(\)/,/^}/' "$SRC" | grep -q '_heartbeat_arm_verify'; then
+if grep -qF '_session_launch_finalize "$_ad_sess"' "$SRC" \
+   && grep -qF '_session_launch_finalize "$SESSION_NAME"' "$SRC" \
+   && grep -qF '_session_launch_finalize "$pane"' "$SRC" \
+   && grep -qF '_heartbeat_arm_verify' <<<"$(awk '/^_session_launch_finalize\(\)/,/^}/' "$SRC")"; then
   ok "background and every interactive launch path share heartbeat auto-arm"
 else
   bad "one or more successful launch paths omit shared heartbeat auto-arm"
