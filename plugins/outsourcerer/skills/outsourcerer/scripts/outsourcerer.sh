@@ -5431,7 +5431,7 @@ record_outcome() {
   esac
   # reason MUST be a fixed enum (never task text) — an unknown reason is dropped, not stored verbatim.
   case "$reason" in
-    ''|test_failure|compile_failure|invalid_output|empty-output|permission_denied|consent_denied|secret_scan|provider_error|timeout|watchdog|merge_conflict|user_cancelled|missing_tool) ;;
+    ''|test_failure|compile_failure|invalid_output|empty-output|permission_denied|consent_denied|secret_scan|provider_error|proxy_tls|timeout|watchdog|merge_conflict|user_cancelled|missing_tool) ;;
     *) reason="" ;;
   esac
   # repo_key MUST be a cksum (numeric) or the PII guarantee breaks; turns MUST be numeric or omitted.
@@ -8623,6 +8623,11 @@ run_job() {
   # `failed` was recorded only as generic provider_error and the actual empty-output failure
   # vanished as soon as the transient supervisor message scrolled away.
   [ "$(cat "$jd/reason" 2>/dev/null || true)" = "empty-output" ] && _rsn="empty-output"
+  # Refine the generic provider_error bucket for the sandboxed-proxy TLS reject: delegate() already
+  # wrote its recognizable hint sentence into THIS job's out.log, so a job-scoped grep (no cross-job
+  # misattribution) lets the ledger/advise tell an environment/proxy failure apart from a real
+  # provider failure. Only refines provider_error -- never overrides timeout/watchdog/etc.
+  [ "$_rsn" = "provider_error" ] && grep -q 'devin TLS handshake failed against a local proxy' "$jd/out.log" 2>/dev/null && _rsn="proxy_tls"
   # Pass EVERY field explicitly — no reliance on exported env (which record_ledger no longer sets).
   record_outcome "$_oc" "$_rsn" "" "$id" "$lane" "$id2" "${OSRC_TASK_CLASS:-}" "$(_repo_key)"
   return "$sc"

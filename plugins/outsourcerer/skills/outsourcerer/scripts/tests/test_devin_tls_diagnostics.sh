@@ -200,6 +200,29 @@ if _is_transport_failure 'max-turns reached' 1; then bad "regression: max-turns 
 # retry trigger) — asserting this keeps the diagnostics-only contract honest.
 if _is_transport_failure "$rustls_fixture" 1; then bad "regression: rustls signature leaked into _is_transport_failure (would change retry behavior)"; else ok "regression: rustls signature stays out of _is_transport_failure"; fi
 
+# --- Scenario 5: the proxy_tls reason is a durable, stored reason (not dropped by the enum). ---
+# record_outcome whitelists reasons and blanks any unknown one; proxy_tls must survive so a
+# proxy-TLS failure is distinguishable from a real provider failure in the ledger.
+if have jq; then
+  record_outcome blocked proxy_tls "" "test-rid-ptls" dv glm-5.2 code 123 >/dev/null 2>&1
+  of="$(_outcomes_current 2>/dev/null)"
+  if [ -n "$of" ] && grep -q '"run_id":"test-rid-ptls"' "$of" 2>/dev/null && grep -q '"reason":"proxy_tls"' "$of" 2>/dev/null; then
+    ok "reason: proxy_tls stored durably by record_outcome (not blanked by the enum)"
+  else
+    bad "reason: proxy_tls was DROPPED by record_outcome (add it to the reason enum)"
+  fi
+else
+  echo "SKIP: reason enum durability (jq absent)"
+fi
+
+# --- Scenario 6: the outcome-time classifier is wired job-scoped (source cross-check). ---
+grep -qF 'provider_error|proxy_tls|timeout' "$SRC" && ok "source: reason enum whitelists proxy_tls" || bad "source: proxy_tls missing from reason enum"
+if grep -q 'devin TLS handshake failed against a local proxy' "$SRC" && grep -q '_rsn="proxy_tls"' "$SRC"; then
+  ok "source: outcome classifier sets proxy_tls from the job's own out.log"
+else
+  bad "source: proxy_tls outcome classifier not wired at outcome-recording time"
+fi
+
 echo
 echo "RESULT: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
