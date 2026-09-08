@@ -90,6 +90,7 @@ _ALL_SUITES="$_ALL_SUITES test_preflight_guard_exempt"
 _ALL_SUITES="$_ALL_SUITES test_preflight_env_isolation"
 _ALL_SUITES="$_ALL_SUITES test_heartbeat_arm_liveness test_heartbeat_autoarm test_heartbeat_stale_alarm test_heartbeat_rearm_command"
 _ALL_SUITES="$_ALL_SUITES test_tier_churn"
+_ALL_SUITES="$_ALL_SUITES test_lane_down_marker"
 for t in $_ALL_SUITES; do
   if [ -f "$SCRIPT_DIR/$t.sh" ]; then
     # Capture rather than discard: a failing suite whose output went to /dev/null makes a CI log say

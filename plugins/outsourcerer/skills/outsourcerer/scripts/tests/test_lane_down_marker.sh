@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# test_lane_down_marker.sh — the LANE-DOWN posture marker primitives (_lane_down_mark /
+# _lane_down_active). Sibling of the quota exhausted-until marker; strict-direction, self-healing
+# TTL, keyed by LANE (not model), expired markers self-purge value-matched. These primitives are
+# inert until a dispatch gate consults them (see the PR's wiring proposal) — this test pins the
+# primitive contract so the wiring can be reviewed/added safely.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SRC="$SCRIPT_DIR/../outsourcerer.sh"
+[ -f "$SRC" ] || { echo "FAIL: cannot find $SRC"; exit 1; }
+bash -n "$SRC" || { echo "FAIL: bash -n failed for $SRC"; exit 1; }
+
+TMP="$(mktemp -d)"; export OSRC_HOME="$TMP"; export HOME="$TMP"
+cleanup() { rm -rf "$TMP"; }; trap cleanup EXIT
+. "$SRC" >/dev/null 2>&1
+
+pass=0; fail=0
+ok()  { echo "PASS: $1"; pass=$((pass + 1)); }
+bad() { echo "FAIL: $1"; fail=$((fail + 1)); }
+
+# Clean: no marker -> not down.
+if _lane_down_active dv; then bad "clean: dv reported down with no marker"; else ok "clean: dv not down initially"; fi
+
+# Mark down -> active within TTL.
+_lane_down_mark dv 300
+if _lane_down_active dv; then ok "marked: dv down within TTL"; else bad "marked: dv NOT down after mark"; fi
+
+# Lane keying: a dispatch/provider name folds to the same lane code as the marker.
+if _lane_down_active devin; then ok "keying: 'devin' folds to dv (same marker)"; else bad "keying: 'devin' did not match the dv marker"; fi
+
+# Isolation: a DIFFERENT lane is unaffected.
+if _lane_down_active or; then bad "isolation: 'or' falsely reported down"; else ok "isolation: 'or' unaffected by the dv marker"; fi
+
+# Strict direction: an already-expired marker is NOT active and is purged on read.
+_posture_set cx down 1   # epoch 1 (1970) -> long expired
+if _lane_down_active cx; then bad "expired: cx still reported down"; else ok "expired: cx not active"; fi
+if [ -e "$OSRC_POSTURE_DIR/cx.down" ]; then bad "expired: marker file not purged on read"; else ok "expired: marker file purged on read"; fi
+
+# Junk value never reads as down (hardening: non-numeric posture value).
+_posture_set gm down "not-a-number"
+if _lane_down_active gm; then bad "junk: non-numeric marker read as down"; else ok "junk: non-numeric marker ignored"; fi
+
+echo "== $pass passed, $fail failed =="
+[ "$fail" -eq 0 ]

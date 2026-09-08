@@ -2654,6 +2654,38 @@ _quota_marker_active() {  # <lanekey> <model> -> rc0 if an unexpired marker exis
   [ "$cur" = "$v" ] && rm -f "$OSRC_POSTURE_DIR/$1.quota-$slug" 2>/dev/null
   return 1
 }
+
+# ---- LANE-DOWN marker (sibling of the quota exhausted-until marker) ----------------------------
+# A lane can be UNREACHABLE without being at-cap: the Devin free GLM probe times out, or a
+# sandboxed-proxy TLS reject makes the whole devin lane unusable. doctor already detects this, but
+# dispatch never consulted it, so a down default absorbed dozens of full-timeout dispatches before
+# falling through. This marker lets a dispatch-time gate skip a known-down LANE for a short,
+# self-healing window. Keyed by LANE (not model): a proxy/transport failure takes the whole lane
+# down, not one model. Strict direction only (forces skip, never forces "up"), mirroring the quota
+# marker's posture contract; expired markers self-purge value-matched. TTL is short so a transient
+# outage heals on its own with no manual reset (override via OSRC_LANE_DOWN_TTL, default 300s).
+_lane_down_mark() {  # <lane-or-disp> [ttl-secs]
+  local lane; lane="$(_quota_lane_key "$1")"
+  [ -n "$lane" ] && [ "$lane" != "?" ] || return 0
+  local ttl="${2:-${OSRC_LANE_DOWN_TTL:-300}}"
+  case "$ttl" in ''|*[!0-9]*) ttl=300 ;; esac
+  local until; until="$(( $(date +%s) + ttl ))"
+  _posture_set "$lane" "down" "$until"
+}
+_lane_down_active() {  # <lane-or-disp> -> rc0 if an unexpired down marker exists (self-purges)
+  local lane; lane="$(_quota_lane_key "$1")"
+  [ -n "$lane" ] && [ "$lane" != "?" ] || return 1
+  local v; v="$(_posture_get "$lane" "down" 2>/dev/null)" || return 1
+  case "$v" in ''|*[!0-9]*) return 1 ;; esac
+  local now; now="$(date +%s)"
+  if [ "$v" -gt "$now" ]; then return 0; fi
+  # Expired -> purge on read, VALUE-MATCHED (same hardening as _quota_marker_active): only delete if
+  # the file still holds the expired value we read, so a sibling's fresh marker in the race is kept.
+  local cur; cur="$(_posture_get "$lane" "down" 2>/dev/null)"
+  [ "$cur" = "$v" ] && rm -f "$OSRC_POSTURE_DIR/$lane.down" 2>/dev/null
+  return 1
+}
+
 # Mark <model> on <lane> exhausted until the next reset, from a REAL provider quota refusal. No-op
 # unless a cap is declared (the marker only reconciles a declared cap; cap-first _quota_gate would
 # ignore it otherwise, and writing one would just litter the posture dir). Reset zone follows the cap.
