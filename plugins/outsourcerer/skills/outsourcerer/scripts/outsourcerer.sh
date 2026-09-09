@@ -6162,6 +6162,30 @@ _tap_statusline_cmd() {
     [ -f "$cmd" ] && { printf '%s tap run' "$cmd"; return; }
     printf 'bash "%s" tap run' "$SCRIPT_PATH"; return   # fallback: explicit bash
   fi
+  # If we are running from a versioned plugin-cache path, emit a command that
+  # resolves the NEWEST installed version at render time instead of hard-pinning
+  # this version's path. A plugin update installs a new version dir and later
+  # prunes the old one; a hard-pinned path then vanishes and the statusline goes
+  # blank with no error. Resolving at render time survives every future update.
+  # Falls back to the current path if nothing resolves.
+  case "$SCRIPT_PATH" in
+    */plugins/cache/*/*/*/skills/outsourcerer/scripts/outsourcerer.sh)
+      local vroot
+      vroot=$(cd "$(dirname "$SCRIPT_PATH")/../../../.." 2>/dev/null && pwd) || vroot=""
+      # Emit the resolver only when the anchor resolved AND both paths are free of
+      # characters that would break (or inject into) the single-quoted `sh -c`
+      # payload. Plugin-cache paths never contain these in practice; if they ever
+      # do, fall through to the plain pinned command below. `sort -V` sorts on the
+      # version component because every glob match shares the same directory prefix.
+      case "$vroot::$SCRIPT_PATH" in
+        ::*|*[\'\"\$\`\\]*) ;;
+        *)
+          printf 'sh -c '\''s=$(ls -d "%s"/*/skills/outsourcerer/scripts/outsourcerer.sh 2>/dev/null | sort -V | tail -1); exec "${s:-%s}" tap run'\''' "$vroot" "$SCRIPT_PATH"
+          return
+          ;;
+      esac
+      ;;
+  esac
   printf '%s tap run' "$SCRIPT_PATH"
 }
 # =============================================================================
