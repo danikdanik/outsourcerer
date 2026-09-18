@@ -127,12 +127,53 @@ Every delegated prompt also carries the **OSRC:: progress protocol** (the delega
 Instead of inheriting your whole rig, inject exactly what a task needs:
 
 ```
-outsourcerer.sh --provider cc run --with skills=recall,repo-forensics "…"   # SKILL.md CONTENTS injected
+outsourcerer.sh --provider cc run --with skills=recall,repo-forensics "…"   # the WHOLE skill transfers
 outsourcerer.sh --provider cc run --with "skills=recall mcp=whatsapp" "…"    # + only that MCP server
+outsourcerer.sh --provider cc run --with skills=all "…"                      # every installed skill
 ```
-`skills=` concatenates each named `SKILL.md` into the prompt (works on any provider, it is just
-markdown). `mcp=` (cc lane) generates a filtered `--mcp-config` exposing ONLY the named servers
-(`--strict-mcp-config`). Pass repeated `--with` or one quoted `--with "skills=… mcp=…"`.
+`skills=` transfers each named skill's FULL directory - `SKILL.md` plus its `references/`,
+`scripts/`, and `assets/` (skill names may contain spaces and unicode; `all` expands to every
+installed skill). On tool-capable lanes (cc/codex/gemini/claudex/droid/cursor/hermes/warp/
+cline, agentic-local) the tree is staged on disk in a unique per-dispatch bundle (never shared or
+swapped under a live delegate) with a manifest that accounts every transferred file AND symlink;
+symlinks that are absolute, escape the skill dir, or dangle, and special files, refuse the
+dispatch outright - tar preserves links verbatim, so even an absolute target that resolves
+in-tree in the SOURCE would stage a live path outside the bundle; only RELATIVE links that stay
+inside the skill are staged, and every staged link resolves beneath the staged skill root.
+On text-only lanes (local chat, tokenrouter) the skill's complete text docs are serialized into
+the prompt byte-faithfully (source bytes preserved exactly, including trailing newlines; one
+framing newline precedes each END marker) with per-file boundaries and exact byte accounting
+against `OSRC_WITH_TEXT_MAX_BYTES` (framing and filenames count; the final
+payload is re-measured against the cap); when the complete payload exceeds the cap the dispatch
+DIES with the precise reason - no truncation - and scripts/assets are called out as NOT
+TRANSFERRED instead of silently dropped. On the Devin lane the tree is linked into the Devin skills home before
+dispatch, scoped per dispatch: links from earlier grants that are not in the current one are
+removed, so the skills home holds exactly what the prompt claims. EVERY Devin dispatch - with or without
+--with - SERIALIZES on a skills-home lock (mkdir-based, stale-pid breaking, held from prepare
+until the synchronous delegate run ends) and scopes the home to exactly that dispatch's grant
+set, so an ungranted run never inherits a previous dispatch's links and two grant sets never
+overlap on the shared home. The stale-link prune validates every marker line with the same grant
+name rules before acting on it - an attacker-written line like `../../victim` is ignored with a
+stderr note, so the marker can never point a deletion outside the skills home. Skill trees whose
+file or directory names contain control characters (CR/LF/TAB) are refused at every staging
+point, and control characters in a skill NAME are rejected at --with validation (tokenizers split
+on them and line-oriented manifests and prompt boundaries cannot represent them). Malformed comma
+lists FAIL at validation instead of being repaired: a leading, trailing, or adjacent comma, or a
+whitespace-only member, names nothing and is never silently dropped.
+A requested capability that cannot resolve FAILS the dispatch on every lane (bundle, text,
+inline, and Devin) - the delegate never runs while its prompt claims a grant that did not
+arrive, and a skill that cannot be staged is announced on stderr. That includes `skills=all`
+expanding to NOTHING (no skills in any searched home): the dispatch fails naming the empty
+grant rather than silently becoming a no-grant run, and a bundle refused for a missing member
+removes its just-built partial root before dying.
+`mcp=` (Claude CLI lanes only: cc native, claudex, cc/OpenRouter) generates a filtered
+`--mcp-config` exposing ONLY the named servers (`--strict-mcp-config`). Repeated mcp= specs
+(`--with mcp=a --with mcp=b`, or `mcp=a mcp=b` in one string) COMBINE into one requested set
+(deduped, exact names) - never last-spec-wins - and every requested server is verified present in
+the generated config BEFORE launch: an absent name in ANY spec, a missing ~/.claude.json, or a
+missing jq all fail the dispatch rather than launching without the grant.
+On any other lane `mcp=` fails loudly at dispatch rather than being silently ignored. Pass repeated `--with` or one quoted
+`--with "skills=… mcp=…"`.
 
 ## Core usage
 

@@ -25,7 +25,7 @@ has '_depth" -gt 12' "oversized scan depth capped (no unbounded walk)"
 has 'FAILED to launch' "fanout reports partial-launch failure and returns nonzero"
 grep -Eq "jq -cn[^|]*>> \"\\\$OSRC_LEDGER\"" "$SRC" && bad "raw 'jq ... >> ledger' still present" || ok "no raw jq-append-to-ledger race"
 # WITH_SPEC split without globbing.
-has 'read -ra _ws <<< "$WITH_SPEC"' "_secret_scan splits WITH_SPEC via read -ra (no glob)"
+has 'done <<_OSRC_GATE_SPECS' "_secret_scan splits WITH_SPEC via _with_specs heredoc (no glob)"
 # Scope the check to _secret_scan: the --with parsers at build_mcp_flags intentionally word-split.
 ss_body="$(awk '/^_secret_scan\(\) *\{/{f=1} f{print} f&&/^}/{exit}' "$SRC")"
 printf '%s' "$ss_body" | grep -Fq 'for tok in $WITH_SPEC' && bad "_secret_scan still has unquoted WITH_SPEC loop" || ok "_secret_scan unquoted WITH_SPEC loop removed"

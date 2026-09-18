@@ -270,7 +270,7 @@ OSRC_FLEET_FORCE="${OSRC_FLEET_FORCE:-0}"
 OSRC_FLEET_COMPACT="${OSRC_FLEET_COMPACT:-suggest}"
 # Any per-run MCP config temp is removed at script exit (only in the main shell, not in
 # command-substitution subshells where the file may still be needed by a later claude invocation).
-trap 'if [ "${BASH_SUBSHELL:-0}" -eq 0 ]; then rm -f "$OSRC_HOME/with-mcp-$$.json" "$OSRC_HOME/.hdr.$$."* 2>/dev/null; fi' EXIT
+trap 'if [ "${BASH_SUBSHELL:-0}" -eq 0 ]; then _devin_skills_lock_release 2>/dev/null; rm -f "$OSRC_HOME/with-mcp-$$.json" "$OSRC_HOME/.hdr.$$."* 2>/dev/null; fi' EXIT
 # ---- state-home writability preflight (FAIL FAST, self-explaining). A sandboxed harness shell
 # (e.g. Claude Code sandbox whose allowWrite covers ~/.local/share/devin but NOT ~/.outsourcerer)
 # lets jobs launch with nowhere to write: terminal status, truncated out.log, sessions lost. One
@@ -2176,6 +2176,145 @@ _utf8_guard_prompt() {
   eval "$_v=\"\${$_v%X}\""
 }
 
+# _devin_with_prepare -> per-dispatch capability transfer for the Devin lane. Devin runs in a
+# REMOTE sandbox: a host path pasted into the prompt is not readable there, so the bundle-dir
+# transport cannot work. What Devin DOES read is its skills home (~/.config/devin/skills), which
+# is how `parity` already carries whole skill trees. This makes that transfer automatic for the
+# skills a run is actually granted: each --with skills=<name> (or all) is symlinked in before
+# dispatch, and the prompt says exactly what arrived. Sets global DEVIN_WITH_PRE (possibly empty).
+# Dies loud when a grant cannot be honored - mcp= has no meaning on this lane, a skill name that
+# resolves to nothing FAILS the dispatch outright, and a skill whose directory cannot be linked
+# must not be reported as present.
+# _skill_tree_names_safe <dir> -> rc0 when NO entry name under <dir> contains a control character
+# (CR/LF/TAB). Every transport here is line-oriented (manifests, read-loops, prompt boundaries):
+# a newline inside a filename splits it into two fake entries, a tab splits tokenizers, and either
+# corrupts the manifest and turns renders into rc=0-with-errors. Refuse such trees at every
+# staging point instead.
+_skill_tree_names_safe() {
+  local _hit
+  _hit="$(cd "$1" 2>/dev/null && find . \( -name "*"$'\n'"*" -o -name "*"$'\r'"*" -o -name "*"$'\t'"*" \) -print -quit | wc -l | tr -d ' ')"
+  [ "${_hit:-0}" = "0" ]
+}
+
+# Devin grant lock: the Devin skills home is ONE shared mutable surface, and each dispatch's
+# prompt claims per-dispatch grants. Two overlapping granted dispatches would leak each other's
+# skills and disagree with the marker - so granted dispatches SERIALIZE on this lock. The Devin
+# delegate runs synchronously under this process, so a lock held from prepare until process exit
+# (released by the EXIT trap) spans the delegate's whole run: no two grant sets ever overlap on
+# the shared home. mkdir is the portable atomic (no flock on macOS); a holder that dies without
+# cleanup is detected via its recorded pid.
+_DEVIN_LOCK_DIR=""
+_devin_skills_lock_acquire() {
+  local dst="$HOME/.config/devin/skills" lock="$dst/.outsourcerer-grants.lock.d" owner tries=0
+  # Ownership key: BASHPID (differs per subshell; $$ does not, which would let two backgrounded
+  # prepares through "together" or deadlock a sequential one). Falls back to $$ on bash 3.2.
+  local me="${BASHPID:-$$}"
+  local max="${OSRC_DEVIN_LOCK_WAIT_MAX:-1800}"; case "$max" in ''|*[!0-9]*) max=1800 ;; esac
+  mkdir -p "$dst" 2>/dev/null || die "--with: cannot create $dst for the Devin grant lock."
+  # Re-entrant: one process may prepare repeatedly (tests, multi-grant flows) without deadlocking
+  # on its own held lock.
+  [ "$(cat "$lock/pid" 2>/dev/null)" = "$me" ] && { _DEVIN_LOCK_DIR="$lock"; return 0; }
+  while ! mkdir "$lock" 2>/dev/null; do
+    owner="$(cat "$lock/pid" 2>/dev/null)"
+    if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+      rm -rf "$lock" 2>/dev/null   # stale: the holder died without releasing
+      continue
+    fi
+    tries=$((tries + 1))
+    [ "$tries" -ge "$max" ] && die "--with: another Devin dispatch has held the skills-home grant lock for ${max}s+ (pid ${owner:-unknown}, lock $lock). Two grant sets never overlap on one shared skills home; wait for that run, or kill it if hung. Refusing to dispatch."
+    sleep 1
+  done
+  printf '%s\n' "$me" > "$lock/pid" 2>/dev/null
+  _DEVIN_LOCK_DIR="$lock"
+}
+_devin_skills_lock_release() {
+  [ -n "$_DEVIN_LOCK_DIR" ] && [ -d "$_DEVIN_LOCK_DIR" ] || return 0
+  [ "$(cat "$_DEVIN_LOCK_DIR/pid" 2>/dev/null)" = "${BASHPID:-$$}" ] && rm -rf "$_DEVIN_LOCK_DIR" 2>/dev/null
+  _DEVIN_LOCK_DIR=""
+}
+
+_devin_with_prepare() {
+  DEVIN_WITH_PRE=""
+  if _with_mcp_requested; then
+    die "--with mcp=... cannot be honored on the Devin lane: MCP parity exists only on the Claude CLI lanes (ccnative, claudex, cc) today, and a Devin delegate would silently run WITHOUT the server(s). Refusing to dispatch. Route via --provider cc (or drop the mcp= grant)."
+  fi
+  local names name dir dst="$HOME/.config/devin/skills" ok=""
+  names="$(_with_skill_names)"   # empty when this dispatch grants no skills
+  if [ -z "$names" ] && _with_specs | grep -q '^skills='; then
+    # skills=all on a host with no resolvable skills must FAIL, not dispatch as a silent no-grant.
+    die "--with skills=all: NO skills were found in any searched home (~/.claude/skills, the plugin caches, and the parity dir), so the grant expands to nothing. An empty skills grant must never dispatch silently. Install the skill(s), name them explicitly, or drop the grant."
+  fi
+  # EVERY Devin dispatch - with or without --with - takes the grant lock and scopes the shared
+  # skills home to exactly this dispatch's grant set (an empty set removes every prior grant).
+  # Otherwise an ungranted run would silently inherit the previous dispatch's links, and two
+  # overlapping dispatches would leak each other's skills while each prompt claims only its own.
+  _devin_skills_lock_acquire
+  # Marker safety: a PLANTED symlink at $marker would make the write below clobber a victim file
+  # (arbitrary overwrite via the skills home). Never follow it: remove the link itself, then
+  # write privately + atomically, and only read a marker that is a regular file we own.
+  local marker="$dst/.outsourcerer-grants" prev
+  if [ -L "$marker" ]; then
+    rm -f "$marker" 2>/dev/null || die "--with: $marker is a symlink and cannot be removed - refusing to dispatch (possible planted-symlink attack)."
+  fi
+  # Per-dispatch scoping: links from earlier dispatches that are not in THIS grant are removed
+  # (only ever symlinks - a real directory the user placed is never touched). With an empty
+  # grant this removes every prior outsourcerer-managed link.
+  if [ -f "$marker" ] && [ ! -L "$marker" ] && [ -O "$marker" ]; then
+    while IFS= read -r prev; do
+      [ -n "$prev" ] || continue
+      # A marker line is UNTRUSTED input: anyone who can write the skills home can write the
+      # marker, and a line like ../../victim would point the removal below at $dst/../../victim,
+      # deleting any user-owned symlink reachable from there. Only a name that passes grant
+      # validation is ever acted on; such a name is exactly one path component, so the parent of
+      # $dst/$prev is always $dst itself and nothing outside the skills home can be reached.
+      if ! _with_skill_name_ok "$prev"; then
+        printf '>>> [with] ignoring an unsafe line in the Devin grant marker %s (not a valid skill name; nothing removed for it).\n' "$marker" >&2
+        continue
+      fi
+      printf '%s\n' "$names" | grep -Fxq -- "$prev" && continue
+      [ -L "$dst/$prev" ] && rm -f "$dst/$prev"
+    done < "$marker"
+  fi
+  # Publish the marker for THIS grant set (possibly empty): mktemp creates the temp file ITSELF
+  # (O_EXCL, non-following, unpredictable name) so a pre-planted symlink is never followed;
+  # verify regular+owned before writing, then rename.
+  local mtmp=""
+  mtmp="$(umask 077; mktemp "$dst/.outsourcerer-grants.tmp.XXXXXX" 2>/dev/null)"
+  if [ -n "$mtmp" ] && [ -f "$mtmp" ] && [ ! -L "$mtmp" ] && [ -O "$mtmp" ] \
+     && ( umask 077; printf '%s\n' "$names" > "$mtmp" ) && mv -f "$mtmp" "$marker" 2>/dev/null; then :; else
+    [ -n "$mtmp" ] && rm -f "$mtmp" 2>/dev/null
+    printf '>>> [with] could not update the Devin grant marker %s; stale-grant cleanup may be skipped next dispatch.\n' "$marker" >&2
+  fi
+  [ -n "$names" ] || return 0   # no skills granted: home scoped, empty marker published
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    dir="$(_resolve_skill_dir "$name" 2>/dev/null)"
+    if [ -z "$dir" ] || [ ! -d "$dir" ]; then
+      die "--with skills=$name: skill NOT FOUND (looked in ~/.claude/skills, the plugin caches, and the parity dir). A requested capability that cannot resolve FAILS the dispatch - the delegate must never run while its prompt claims a grant that did not arrive. Install the skill, or drop it from the grant."
+    fi
+    _skill_tree_names_safe "$dir" || die "--with skills=$name: the skill contains file/dir names with control characters (CR/LF/TAB) - line-oriented grant handling cannot represent them, so the grant is refused. Rename the offending entries (no carriage returns, newlines, or tabs in names) and retry."
+    mkdir -p "$dst" || die "--with skills=$name: cannot create $dst for the per-dispatch Devin skill sync."
+    # Symlink (never a copy): plugin upgrades move the target, and the parity healer re-pins these
+    # exact links. A failed link is a loud dispatch refusal, not a quietly absent capability.
+    ln -sfn "$dir" "$dst/$name" 2>/dev/null       || die "--with skills=$name: could not link $dir into $dst - refusing to dispatch with the capability silently absent. Fix the permissions on $dst, or drop the grant."
+    [ -e "$dst/$name/SKILL.md" ]       || die "--with skills=$name: linked into $dst but $dst/$name/SKILL.md does not resolve - refusing to dispatch with the capability silently absent."
+    ok="${ok}${name}
+"
+  done <<_OSRC_DEVIN_NAMES
+$names
+_OSRC_DEVIN_NAMES
+  [ -n "$ok" ] && DEVIN_WITH_PRE="You have been granted the following skill(s). Each was synced into your skills home with its FULL directory contents (SKILL.md plus references/, scripts/, assets/) just before this run:
+$(while IFS= read -r name; do [ -n "$name" ] && printf '  %s (%s)\n' "$name" "$dst/$name"; done <<_OSRC_DEVIN_OK
+$ok
+_OSRC_DEVIN_OK
+)
+Read the skill's SKILL.md first with your file tools, then follow the files it references inside its own directory; its scripts are executable. You do NOT have any skill that is not listed here."
+  [ -n "$DEVIN_WITH_PRE" ] && DEVIN_WITH_PRE="$DEVIN_WITH_PRE
+
+"
+  return 0
+}
+
 # delegate <perm> <sandbox-flag-or-empty> [-m MODEL] "<task>"
 delegate() {
   local perm="$1"; shift
@@ -2183,6 +2322,8 @@ delegate() {
   parse_model "$@"
   [ "${#REST[@]}" -gt 0 ] || die "no task prompt given"
   local prompt; prompt="$(_effort_prompt "${REST[*]}")"
+  _devin_with_prepare   # per-dispatch skill sync for this lane (dies loud on an unhonorable grant)
+  [ -n "$DEVIN_WITH_PRE" ] && prompt="$DEVIN_WITH_PRE$prompt"
   _utf8_guard_prompt prompt   # sanitize invalid UTF-8 in the effort-wrapped prompt before it reaches the devin CLI
   # Devin has no native reasoning-effort knob. If --effort was given, surface it as advisory
   # ONLY (it is consumed by parse_model, never passed to the devin CLI, which would 'unexpected argument').
@@ -3764,12 +3905,24 @@ wrap_prompt() {
 # A skill can live in the user's own dir, inside an installed PLUGIN's versioned cache, or in the
 # parity dir we symlink for delegate lanes. Searching only the first silently drops every plugin skill.
 # Plugin caches are version-scoped, so the newest version wins rather than whichever glob sorts first.
+# _with_skill_name_ok <name> -> rc0 when <name> is a safe single path component. Names may
+# contain spaces and unicode (skill dirs like 'space ünicode' are real), so the charset is a
+# DENYLIST, not an allowlist: no separators or glob metacharacters, no control characters
+# (TAB/CR/LF split tokenizers and line-oriented transports), never . / .. - a granted name
+# must name exactly one directory entry and nothing else.
+_with_skill_name_ok() {
+  case "$1" in ''|.|..) return 1 ;; esac
+  case "$1" in *[/\\]*|*\**|*\?*|*\[*|*=*|*,*|*[[:cntrl:]]*) return 1 ;; esac
+  return 0
+}
+
 _resolve_skill_file() {
   local name="$1" p
   # A skill name is a single path component, never a traversal. Reject anything with a slash or
   # other path metacharacter so `name` cannot be spliced into a parent directory (e.g.
-  # `../../projects/evil`) and pull an arbitrary SKILL.md into the delegate prompt.
-  case "$name" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  # `../../projects/evil`) and pull an arbitrary SKILL.md into the delegate prompt. Spaces and
+  # unicode are fine (real skill dirs carry them); see _with_skill_name_ok.
+  _with_skill_name_ok "$name" || return 1
   for p in "$HOME/.claude/skills/$name/SKILL.md" \
            "$HOME/.config/devin/skills/$name/SKILL.md"; do
     [ -f "$p" ] && { printf '%s' "$p"; return 0; }
@@ -3778,6 +3931,73 @@ _resolve_skill_file() {
   p="$(ls -1d "$HOME"/.claude/plugins/cache/*/*/*/skills/"$name"/SKILL.md 2>/dev/null | sort -V | tail -1)"
   [ -n "$p" ] && [ -f "$p" ] && { printf '%s' "$p"; return 0; }
   return 1
+}
+
+# _resolve_skill_dir <name> -> the skill's whole DIRECTORY (the dir holding its SKILL.md), so a
+# granted capability transfers as the full bundle the skill author shipped (references/, scripts/,
+# assets/), not only the top doc. Same homes, same precedence, same name validation as
+# _resolve_skill_file (which does the validating for us).
+_resolve_skill_dir() {
+  local f; f="$(_resolve_skill_file "${1:-}")" || return 1
+  [ -n "$f" ] || return 1
+  dirname "$f"
+}
+
+# _list_all_skills -> every resolvable skill name across the user dir, the parity dir, and the
+# plugin caches (deduped; resolution precedence per name stays _resolve_skill_file's). Used by
+# `--with skills=all`. Only names that actually resolve are listed, so a stray empty dir never
+# turns into a phantom grant.
+_list_all_skills() {
+  local d name
+  {
+    for d in "$HOME"/.claude/skills/*/ "$HOME"/.config/devin/skills/*/ "$HOME"/.claude/plugins/cache/*/*/*/skills/*/; do
+      [ -d "$d" ] || continue
+      name="$(basename "$d")"
+      _resolve_skill_file "$name" >/dev/null 2>&1 && printf '%s\n' "$name"
+    done
+  } | sort -u
+}
+
+# _with_skill_names -> the granted skill names from WITH_SPEC, expanding `all`. Empty when no
+# skills= token is present. Names came through _validate_with_token + _resolve_skill_file's own
+# metacharacter rejection, so they are single path components.
+# _with_specs -> WITH_SPEC normalized to one spec per line. A token beginning skills= or mcp=
+# starts a NEW spec; any other whitespace token is a continuation of the previous spec's value.
+# That is how skill names containing spaces survive WITH_SPEC's space-joined storage:
+# --with 'skills=space ünicode' arrives as two tokens and reassembles into one spec here.
+_with_specs() {
+  [ -n "${WITH_SPEC:-}" ] || return 0
+  local tok cur=""
+  _words_noglob "$WITH_SPEC"
+  for tok in ${WORDS[@]+"${WORDS[@]}"}; do
+    case "$tok" in
+      skills=*|mcp=*) [ -n "$cur" ] && printf '%s\n' "$cur"; cur="$tok" ;;
+      *)              cur="$cur $tok" ;;
+    esac
+  done
+  [ -n "$cur" ] && printf '%s\n' "$cur"
+}
+
+_with_skill_names() {
+  local spec name
+  [ -n "${WITH_SPEC:-}" ] || return 0
+  _with_specs | while IFS= read -r spec; do
+    case "$spec" in
+      skills=?*) printf '%s\n' "${spec#skills=}" | tr ',' '\n' ;;
+    esac
+  done | while IFS= read -r name; do
+    # trim surrounding whitespace (a comma list may carry it: skills=a, b)
+    name="${name#"${name%%[![:space:]]*}"}"
+    name="${name%"${name##*[![:space:]]}"}"
+    [ -n "$name" ] || continue
+    if [ "$name" = "all" ]; then _list_all_skills; else printf '%s\n' "$name"; fi
+  done | awk '!seen[$0]++'
+}
+
+# _with_mcp_requested -> rc0 when WITH_SPEC asks for any mcp= server.
+_with_mcp_requested() {
+  [ -n "${WITH_SPEC:-}" ] || return 1
+  _with_specs | grep -q '^mcp='
 }
 
 # _validate_with_token <arg> -> die unless every whitespace-separated token in <arg> is a
@@ -3809,36 +4029,366 @@ _words_noglob() {
 }
 
 _validate_with_token() {
-  local tok n=0
+  local tok n=0 cur=""
+  # A literal control character in the spec is never legitimate - names use spaces, every
+  # transport here is line-oriented (a newline inside a name splits it into two fake entries),
+  # and the tokenizer itself splits on TAB, silently turning one name into two fragments.
+  case "${1:-}" in *[[:cntrl:]]*) die "--with: control characters (CR/LF/TAB) are not allowed in a spec - names may contain spaces, never control characters" ;; esac
   local IFS=$' \t\n'
   _words_noglob "${1:-}"
   for tok in ${WORDS[@]+"${WORDS[@]}"}; do
     n=$((n + 1))
     case "$tok" in
-      skills=?*|mcp=?*) ;;
-      *) die "--with requires e.g. skills=a,b or mcp=x (got '$tok'); an unrecognized spec is rejected rather than silently dropped" ;;
+      skills=*|mcp=*) cur="$tok" ;;
+      *) # A non-spec token is legal ONLY as the continuation of a spaced skill name
+         # (skills=space ünicode). Before any spec it is the old silent-drop footgun.
+         [ -n "$cur" ] || die "--with requires e.g. skills=a,b or mcp=x (got '$tok'); an unrecognized spec is rejected rather than silently dropped"
+         cur="$cur $tok" ;;
     esac
   done
   # A whitespace-only spec is non-empty (the parse-site die does not fire) but splits to nothing,
   # which is the same silent no-op this validator exists to make loud.
   [ "$n" -gt 0 ] || die "--with requires e.g. skills=a,b or mcp=x (got a whitespace-only spec); an unrecognized spec is rejected rather than silently dropped"
+  # Validate the assembled spec's value: non-empty, and every comma-separated name a safe single
+  # path component (spaces/unicode fine; traversal and glob metacharacters refused).
+  local val name badname=""
+  val="${cur#*=}"
+  [ -n "${val//[[:space:]]/}" ] || die "--with requires a non-empty value (got '$cur'); an empty grant is a silent no-op"
+  # Malformed list syntax FAILS, never repairs: an empty member names nothing, and silently
+  # dropping it would honor a different grant than the one written. The raw value is checked
+  # before line splitting because a trailing comma splits to no line at all and would otherwise
+  # slip through ("mcp=one," normalized to "one" rc=0). Leading comma, trailing comma (with or
+  # without trailing space), adjacent commas, and whitespace-only members are all malformed.
+  # A spaced list like "mcp=a, b" stays legal: every member is non-empty after trimming.
+  case "$val" in
+    ,*|*,|*,,*|*,[[:space:]],*|*,[[:space:]])
+      die "--with: malformed name list in '$cur' (an empty member around a comma names nothing; name every member or remove the comma)" ;;
+  esac
+  while IFS= read -r name; do
+    name="${name#"${name%%[![:space:]]*}"}"
+    name="${name%"${name##*[![:space:]]}"}"
+    if [ -z "$name" ]; then badname="(empty name in list)"; break; fi
+    _with_skill_name_ok "$name" || { badname="$name"; break; }
+  done <<_OSRC_WITH_NAMES
+$(printf '%s' "$val" | tr ',' '\n')
+_OSRC_WITH_NAMES
+  [ -z "$badname" ] || die "--with: invalid name '$badname' in '$cur' (names may contain spaces and unicode, but not / \\ * ? [ = , and never . or ..)"
 }
 
-build_with_preamble() {
+# build_with_preamble [transport] -> echoes the capability block for WITH_SPEC, or nothing.
+# TRANSPORTS (chosen per lane at the _build_prompt call site; empty = legacy inline):
+#   bundle      host-tool lanes (a local CLI with file/shell tools runs the job): each granted skill
+#               transfers as its FULL on-disk directory (SKILL.md + references/ + scripts/ + assets/)
+#               in a per-job bundle with a manifest; the preamble points at it.
+#   bundle+mcp  the Claude CLI lanes (ccnative/claudex/cc): bundle transport, and --with mcp= stays
+#               honored through build_mcp_flags_cc.
+#   text        text-only lanes (local chat curl, tokenrouter): SKILL.md plus every TEXT doc in the
+#               tree is serialized into the prompt with explicit per-file boundaries and hard byte
+#               accounting; scripts/assets cannot run there and are called out as NOT TRANSFERRED.
+#   inline      legacy: SKILL.md text only, OSRC_WITH_MAX_BYTES cap. Default for unported paths.
+# A requested capability that cannot make the trip FAILS the dispatch, never a silent no-op:
+# mcp= on any transport but bundle+mcp dies at dispatch, and a skill name that resolves to
+# nothing dies at the render (bundle/text/inline) or prepare (Devin) for that lane.
+# _with_preamble_render [transport] -> sets global WITH_PRE_OUT; dies IN-PROCESS on an unhonorable
+# grant. _build_prompt calls this directly (never in a $(...) subshell, where die would only kill
+# the subshell and dispatch would continue with an empty preamble - the exact silent-failure class
+# this feature exists to remove).
+_with_preamble_render() {
+  WITH_PRE_OUT=""
+  WITH_PRE_RENDERED_FOR="${WITH_SPEC:-}|${1:-inline}"
   [ -n "${WITH_SPEC:-}" ] || return 0
-  local tok val name f out=""
-  _words_noglob "$WITH_SPEC"
-  for tok in ${WORDS[@]+"${WORDS[@]}"}; do
-    case "$tok" in
-      skills=*) val="${tok#skills=}"
-        _words_noglob "$(printf '%s' "$val" | tr ',' ' ')"
-        for name in ${WORDS[@]+"${WORDS[@]}"}; do
-          # Resolve across every place a skill really lives, not just the user's own skills dir.
-          # Only ~/.claude/skills was searched before, so every PLUGIN skill (the whole ce-* family)
-          # silently resolved to "NOT FOUND" and the delegate ran without the capability the caller
-          # believed it had granted. A capability promise that fails quietly is worse than one that
-          # was never offered, because nobody goes looking.
-          f="$(_resolve_skill_file "$name")"
+  local transport="${1:-inline}"
+  if _with_mcp_requested; then
+    case "$transport" in
+      bundle+mcp|inline) ;;   # honored (bundle+mcp) / legacy path unchanged (inline)
+      *) die "--with mcp=... cannot be honored on this lane: MCP parity exists only on the Claude CLI lanes (ccnative, claudex, cc) today, and this lane would silently run WITHOUT the server(s). Refusing to dispatch. Route via --provider cc (or drop the mcp= grant)." ;;
+    esac
+  fi
+  case "$transport" in
+    bundle|bundle+mcp) _with_preamble_bundle ;;
+    text)              _with_preamble_text ;;
+    *)                 _with_preamble_inline ;;
+  esac
+}
+
+# build_with_preamble [transport] -> prints the render (test/direct-call contract). Dispatch code
+# must use _with_preamble_render in-process instead (see its comment).
+build_with_preamble() {
+  _with_preamble_render "$@"
+  printf '%s' "$WITH_PRE_OUT"
+}
+
+# _with_bundle_root -> a UNIQUE, immutable bundle directory for THIS dispatch. Concurrency: a
+# shared root swapped in place can be yanked mid-run by a second dispatch that still holds the
+# old path (foreground runs share $OSRC_HOME when OSRC_JOB_DIR is unset), so every render gets
+# its own root (PID + monotonic counter) and a published bundle is never swapped or removed
+# while any delegate may be reading it.
+_WITH_BUNDLE_SEQ=0
+# Sets global WITH_BUNDLE_ROOT (never call in $(...) - the subshell would swallow the counter
+# increment and every dispatch would collide on seq 1).
+_with_bundle_root() {
+  _WITH_BUNDLE_SEQ=$((_WITH_BUNDLE_SEQ + 1))
+  WITH_BUNDLE_ROOT="${OSRC_JOB_DIR:-$OSRC_HOME}/skill-bundle.$$.$_WITH_BUNDLE_SEQ"
+}
+
+# _canon_path <path> -> canonical absolute path (every symlink on the existing prefix resolved);
+# the leaf itself need not exist. Portable: no realpath, no readlink -f (BSD readlink lacks -f).
+_canon_path() {
+  local p="$1" d b
+  case "$p" in /*) ;; *) p="$PWD/$p" ;; esac
+  d="$(dirname "$p")"; b="$(basename "$p")"
+  ( cd "$d" 2>/dev/null && printf '%s/%s\n' "$(pwd -P)" "$b" )
+}
+
+# _skill_bundle_build <root> <names...> -> populate <root> with each named skill's full directory
+# tree + MANIFEST.txt. Sets globals BUNDLE_OK / BUNDLE_MISSING (space-separated names). Dies loud
+# when the bundle would exceed OSRC_BUNDLE_MAX_BYTES (default 8MB): a partial capability that
+# looks whole is worse than a refused dispatch. Atomic-ish publish (build aside, then swap) so a
+# concurrent reader never sees a half-written bundle.
+_skill_bundle_build() {
+  local root="$1"; shift
+  local cap="${OSRC_BUNDLE_MAX_BYTES:-8388608}"
+  case "$cap" in ''|*[!0-9]*) cap=8388608 ;; esac
+  local tmp="$root.tmp.$$" old="$root.old.$$"
+  rm -rf "$tmp" "$old" 2>/dev/null
+  mkdir -p "$tmp" || die "skill bundle: cannot create $tmp"
+  BUNDLE_OK=""; BUNDLE_MISSING=""
+  local name dir sz total=0
+  local manifest="$tmp/MANIFEST.txt"
+  : > "$manifest"
+  printf '# outsourcerer skill bundle manifest (one skill= line per granted skill, then per-file sizes)\n' >> "$manifest"
+  for name in "$@"; do
+    [ -n "$name" ] || continue
+    dir="$(_resolve_skill_dir "$name" 2>/dev/null)"
+    if [ -z "$dir" ] || [ ! -d "$dir" ]; then BUNDLE_MISSING="${BUNDLE_MISSING}${name}
+"; continue; fi
+    _skill_tree_names_safe "$dir" || { rm -rf "$tmp"; die "skill bundle: skill '$name' contains file/dir names with control characters (CR/LF/TAB) - the line-oriented manifest cannot represent them, so the grant is refused. Rename the offending entries (no carriage returns, newlines, or tabs in names) and retry."; }
+    # Containment: the tar copy PRESERVES symlinks VERBATIM, so any link that does not stay
+    # relative-and-inside the skill stages a live path out of the bundle. That includes an
+    # ABSOLUTE target that resolves in-tree in the SOURCE: the source-tree check passes it, but
+    # the staged link still points at the LIVE source path - mutable host state outside the
+    # bundle, which breaks the immutable-bundle claim. A file-only manifest never even lists the
+    # link. Refuse the grant outright: an absolute, escaping, or dangling link is a broken
+    # capability, not something to stage quietly. RELATIVE links that resolve INSIDE the skill
+    # are kept and listed (they stage identically and stay in-tree).
+    local dcanon l ltgt labs lcanon badl="" nlinks=0
+    dcanon="$(_canon_path "$dir")"
+    while IFS= read -r l; do
+      [ -n "$l" ] || continue
+      l="${l#./}"; nlinks=$((nlinks + 1))
+      ltgt="$(readlink "$dir/$l" 2>/dev/null)"
+      case "$ltgt" in
+        /*) badl="$badl $l(absolute)" ;;
+        *)  labs="$(dirname "$dir/$l")/$ltgt"
+            lcanon="$(_canon_path "$labs")"
+            case "$lcanon" in
+              "$dcanon"|"$dcanon"/*) [ -e "$dir/$l" ] || badl="$badl $l(dangling)" ;;
+              *)                     badl="$badl $l(escapes)" ;;
+            esac ;;
+      esac
+    done <<_OSRC_BUNDLE_LINKS
+$(cd "$dir" && find . -type l -not -path './.git/*' 2>/dev/null)
+_OSRC_BUNDLE_LINKS
+    [ -z "$badl" ] || { rm -rf "$tmp"; die "skill bundle: skill '$name' ships symlink(s) that are absolute, escape the skill directory, or dangle:$badl - staging them would hand the delegate a live path OUTSIDE the bundle, so the grant is refused. Replace the link(s) with real files (or RELATIVE links that stay inside the skill) and retry."; }
+    # Special files (fifo/socket/device) would tar-copy into the bundle UNLISTED - the manifest
+    # accounts regular files and symlinks, so anything else breaks the accounting contract.
+    local special
+    special="$(cd "$dir" && find . -not -type f -not -type d -not -type l -not -path './.git' -not -path './.git/*' 2>/dev/null | head -5)"
+    [ -z "$special" ] || { rm -rf "$tmp"; die "skill bundle: skill '$name' contains non-regular file(s) (fifo/socket/device):$(printf '%s' "$special" | tr '\n' ' ') - refusing to stage (every transferred entry must be manifest-accounted). Remove the special file(s) and retry."; }
+    sz="$(find "$dir" -type f -exec wc -c {} + 2>/dev/null | awk '$2!="total"{s+=$1} END{print s+0}')"
+    total=$((total + sz))
+    [ "$total" -le "$cap" ] || { rm -rf "$tmp"; die "skill bundle would exceed OSRC_BUNDLE_MAX_BYTES=${cap} bytes when adding skill '$name' (skills are copied whole so the delegate gets the real tree). Raise the cap or grant fewer skills."; }
+    mkdir -p "$tmp/$name" || { rm -rf "$tmp"; die "skill bundle: cannot create $tmp/$name"; }
+    # tar pipe, not cp -R: excludes any nested .git and behaves the same on BSD and GNU.
+    (cd "$dir" && tar --exclude='./.git' -cf - .) | (cd "$tmp/$name" && tar -xf -) \
+      || { rm -rf "$tmp"; die "skill bundle: failed to copy skill '$name' from $dir"; }
+    local _sr=0 _ss=0 _sa=0
+    [ -d "$dir/references" ] && _sr=1; [ -d "$dir/scripts" ] && _ss=1; [ -d "$dir/assets" ] && _sa=1
+    local _nf; _nf="$(find "$dir" -type f | wc -l | tr -d ' ')"
+    printf 'skill=%s source=%s files=%s bytes=%s references=%s scripts=%s assets=%s links=%s\n' \
+      "$name" "$dir" "$_nf" "$sz" "$_sr" "$_ss" "$_sa" "$nlinks" >> "$manifest"
+    (cd "$dir" && find . -type f | sort | while IFS= read -r f; do
+       f="${f#./}"
+       printf 'file=%s/%s bytes=%s\n' "$name" "$f" "$(wc -c < "$dir/$f" 2>/dev/null | tr -d ' ')"
+     done) >> "$manifest"
+    # Symlinks are accounted too: every staged link is listed with its target (containment was
+    # verified above, so a listed target is always relative and stays inside the staged skill).
+    (cd "$dir" && find . -type l -not -path './.git/*' | sort | while IFS= read -r l; do
+       l="${l#./}"
+       printf 'link=%s/%s target=%s\n' "$name" "$l" "$(readlink "$dir/$l" 2>/dev/null)"
+     done) >> "$manifest"
+    BUNDLE_OK="${BUNDLE_OK}${name}"
+
+  done
+  [ -d "$root" ] && mv "$root" "$old"
+  mv "$tmp" "$root" || die "skill bundle: cannot publish $root"
+  rm -rf "$old" 2>/dev/null
+  # Janitor: per-dispatch roots accumulate; sweep ones untouched for 2+ days (a delegate still
+  # running after that is pathological, and a live bundle is never this old in practice).
+  find "${OSRC_JOB_DIR:-$OSRC_HOME}" -maxdepth 1 -type d -name 'skill-bundle.*' -mtime +2 -exec rm -rf {} + 2>/dev/null || true
+  return 0
+}
+
+# _with_preamble_bundle: point the delegate at the on-disk bundles. Nothing is pasted; the delegate
+# reads what it needs, so there is no prompt-size cap on this path and the 20KB ceiling is gone.
+_with_preamble_bundle() {
+  local names name root
+  names="$(_with_skill_names)"
+  if [ -z "$names" ]; then
+    # skills=all with no resolvable skills anywhere FAILS; an mcp=-only spec simply has no
+    # skills to bundle.
+    _with_specs | grep -q '^skills=' && die "--with skills=all: NO skills were found in any searched home (~/.claude/skills, the plugin caches, and the parity dir), so the grant expands to nothing. An empty skills grant must never dispatch silently. Install the skill(s), name them explicitly, or drop the grant."
+    return 0
+  fi
+  _with_bundle_root; root="$WITH_BUNDLE_ROOT"
+  # Names are newline-separated and may contain spaces: pass them as positional args, never
+  # unquoted expansion.
+  set --
+  while IFS= read -r _n; do [ -n "$_n" ] && set -- "$@" "$_n"; done <<_OSRC_BUNDLE_NAMES
+$names
+_OSRC_BUNDLE_NAMES
+  _skill_bundle_build "$root" "$@"
+  local name2
+  if [ -n "$BUNDLE_MISSING" ]; then
+    local _misslist=""
+    while IFS= read -r name2; do [ -n "$name2" ] && _misslist="$_misslist $name2"; done <<_OSRC_BUNDLE_MISS
+$BUNDLE_MISSING
+_OSRC_BUNDLE_MISS
+    # The dispatch dies: remove the JUST-BUILT partial root (unique to this render - a missing
+    # member must never leave a half-grant bundle on disk for a later reader to find).
+    rm -rf "$root" 2>/dev/null
+    die "--with skills: requested skill(s) NOT FOUND:${_misslist} (looked in ~/.claude/skills, the plugin caches, and the parity dir). A requested capability that cannot resolve FAILS the dispatch - the delegate must never run while its prompt claims a grant that did not arrive. Install the skill(s), or drop them from the grant."
+  fi
+  local out=""
+  [ -n "$BUNDLE_OK" ] && out="You have been granted the following skill(s) as COMPLETE on-disk bundles. Each skill's FULL directory - SKILL.md plus every references/, scripts/, and assets/ file the skill ships - is on disk:
+"
+  while IFS= read -r name2; do
+    [ -n "$name2" ] || continue
+    out="$out  $name2: $root/$name2/
+"
+  done <<_OSRC_BUNDLE_OKL
+$BUNDLE_OK
+_OSRC_BUNDLE_OKL
+  [ -n "$BUNDLE_OK" ] && out="${out}The manifest ($root/MANIFEST.txt) lists every file, symlink, and size.
+HOW TO USE: with your file-read tool, read the skill's SKILL.md FIRST, then follow every file it references inside its own directory. Scripts under the bundle are executable with your shell tool. You do NOT have any skill that is not listed here."
+  WITH_PRE_OUT="$out"
+}
+
+# _with_text_file_p <path> -> rc0 for doc files a text-only delegate can meaningfully receive.
+_with_text_file_p() {
+  case "$1" in
+    *.md|*.markdown|*.txt|*.rst|*.MD) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _with_preamble_text: serialize the full TEXT of each granted skill into the prompt - SKILL.md plus
+# every doc file in its tree - with explicit per-file boundaries and EXACT byte accounting against
+# OSRC_WITH_TEXT_MAX_BYTES (boundaries and filenames count too). When the complete serialized
+# payload exceeds the cap the dispatch DIES with the precise reason: this lane transfers the
+# complete skill text or refuses. Scripts/assets/binaries cannot execute on a text-only lane;
+# they are listed as NOT TRANSFERRED (inline + stderr), so nobody believes the delegate can run them.
+_with_preamble_text() {
+  local names name dir f rel sz out="" nontext="" content
+  local cap="${OSRC_WITH_TEXT_MAX_BYTES:-100000}"
+  case "$cap" in ''|*[!0-9]*) cap=100000 ;; esac
+  names="$(_with_skill_names)"
+  if [ -z "$names" ]; then
+    _with_specs | grep -q '^skills=' && die "--with skills=all: NO skills were found in any searched home (~/.claude/skills, the plugin caches, and the parity dir), so the grant expands to nothing. An empty skills grant must never dispatch silently. Install the skill(s), name them explicitly, or drop the grant."
+    return 0
+  fi
+  # The cap covers EVERY byte that lands in the prompt - the intro line, per-file boundary
+  # headers/footers, filenames, and the NOT TRANSFERRED lists - not just file payloads. Counting
+  # only payload bytes let 800 empty long-named files serialize to 2x the cap. used is measured
+  # on the exact serialized chunks below, so the accounting is the payload itself.
+  local intro="You have been granted the following capability docs (complete skill text; use them as needed)."
+  local used; used=$(printf '%s' "$intro" | wc -c | tr -d ' ')
+  local chunk csz
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    dir="$(_resolve_skill_dir "$name" 2>/dev/null)"
+    if [ -z "$dir" ] || [ ! -d "$dir" ]; then
+      # A requested capability that cannot resolve FAILS the dispatch (never a rendered
+      # NOT FOUND note): the delegate must never run while its prompt claims a grant that
+      # did not arrive, and the caller must learn it before any CLI launches.
+      die "text transport: skill '$name' NOT FOUND (looked in ~/.claude/skills, the plugin caches, and the parity dir). A requested capability that cannot resolve FAILS the dispatch. Install the skill, or drop it from the grant."
+    fi
+    _skill_tree_names_safe "$dir" || die "text transport: skill '$name' contains file/dir names with control characters (CR/LF/TAB) - line-oriented prompt boundaries cannot represent them, so the grant is refused. Rename the offending entries (no carriage returns, newlines, or tabs in names) and retry."
+    # SKILL.md first, then the rest of the tree sorted; docs only on this path.
+    local _files
+    _files="$( { printf '%s\n' "$dir/SKILL.md"; cd "$dir" && find . -type f -not -path './.git/*' | sort | while IFS= read -r f; do f="${f#./}"; [ "$f" = "SKILL.md" ] && continue; _with_text_file_p "$f" && printf '%s/%s\n' "$dir" "$f"; done; } )"
+    local _nt=""
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      rel="${f#$dir/}"
+      sz="$(wc -c < "$f" 2>/dev/null | tr -d ' ')"; sz="${sz:-0}"
+      # NUL bytes cannot survive a bash string: bash silently DROPS them (before\0after reaches
+      # the delegate as beforeafter, rc=0, and even the cap would measure the corrupted form).
+      # Refuse the file - a grant must never arrive corrupted.
+      [ "$(tr -d '\000' < "$f" 2>/dev/null | wc -c | tr -d ' ')" = "$sz" ] \
+        || die "text transport: $name/$rel contains NUL byte(s), which a prompt string cannot represent without silently dropping bytes. Binary content does not belong on a text lane: route this skill to a tool-capable lane (bundle transport) or remove the NUL byte(s)."
+      # Byte-faithful content: $(cat "$f") alone strips ALL trailing newlines (alpha\n\n\n would
+      # arrive as alpha\n). The sentinel append keeps the source bytes exact. Framing contract:
+      # the file's exact bytes follow the header line, then ONE framing newline, then the END
+      # marker (so the marker always starts on its own line).
+      content="$(cat "$f"; printf 'x')"; content="${content%x}"
+      chunk="
+=== INJECTED SKILL FILE: $name/$rel ($sz bytes) ===
+$content
+=== END SKILL FILE: $name/$rel ==="
+      csz=$(printf '%s' "$chunk" | wc -c | tr -d ' ')
+      # HARD refuse, never truncate: a delegate holding a partial skill believes it has capability
+      # it does not. The FULL serialized payload fits, or the dispatch dies here with the reason.
+      [ $((used + csz)) -le "$cap" ] || die "text transport: --with skills=$name cannot be serialized within OSRC_WITH_TEXT_MAX_BYTES=$cap: the complete payload needs $((used + csz)) bytes so far and file $name/$rel ($sz bytes) pushes it over. Text lanes transfer the COMPLETE skill text or REFUSE - no silent truncation. Raise OSRC_WITH_TEXT_MAX_BYTES or grant fewer skills."
+      used=$((used + csz)); out="$out$chunk"
+    done <<_OSRC_WITH_FILES
+$_files
+_OSRC_WITH_FILES
+    # Non-text payload (scripts/assets/binaries): cannot run here - say so, per file.
+    _nt="$(cd "$dir" && find . -type f -not -path './.git/*' | sort | while IFS= read -r f; do f="${f#./}"; _with_text_file_p "$f" || printf '%s (%s bytes)\n' "$f" "$(wc -c < "$dir/$f" 2>/dev/null | tr -d ' ')"; done)"
+    if [ -n "$_nt" ]; then
+      chunk="
+=== NOT TRANSFERRED (text-only lane - these cannot execute here): skill $name:
+$_nt
+==="
+      csz=$(printf '%s' "$chunk" | wc -c | tr -d ' ')
+      [ $((used + csz)) -le "$cap" ] || die "text transport: --with skills=$name cannot be serialized within OSRC_WITH_TEXT_MAX_BYTES=$cap: the NOT TRANSFERRED listing for $name pushes the complete payload to $((used + csz)) bytes. Text lanes transfer the COMPLETE skill text or REFUSE - no silent truncation. Raise OSRC_WITH_TEXT_MAX_BYTES or grant fewer skills."
+      used=$((used + csz)); out="$out$chunk"
+      printf '>>> [with] skill %s: %s non-text file(s) (scripts/assets) can NOT run on a text-only lane and were not transferred. The delegate gets the docs only; route to a tool-capable lane if the skill'\''s scripts must run.\n' "$name" "$(printf '%s\n' "$_nt" | grep -c .)" >&2
+    fi
+  done <<_OSRC_WITH_NAMES2
+$names
+_OSRC_WITH_NAMES2
+  if [ -n "$out" ]; then
+    WITH_PRE_OUT="$intro$out"
+    # Belt and braces: the FINAL payload, not the running total, is the contract. Measure it.
+    local _actual; _actual=$(printf '%s' "$WITH_PRE_OUT" | wc -c | tr -d ' ')
+    [ "$_actual" -le "$cap" ] || die "text transport: serialized payload is $_actual bytes against OSRC_WITH_TEXT_MAX_BYTES=$cap (accounting must never disagree with the payload); refusing to dispatch. Raise the cap or grant fewer skills."
+  fi
+  return 0
+}
+
+# _with_preamble_inline: the legacy transport - SKILL.md text only, OSRC_WITH_MAX_BYTES cap.
+_with_preamble_inline() {
+  local spec val name f out=""
+  while IFS= read -r spec; do
+    case "$spec" in
+      skills=*) val="${spec#skills=}"
+        while IFS= read -r name; do
+          name="${name#"${name%%[![:space:]]*}"}"
+          name="${name%"${name##*[![:space:]]}"}"
+          [ -n "$name" ] || continue
+          # `all` has no meaning on the legacy path's per-file pasting; expand it so the grant is
+          # still honored. An empty expansion (no skills anywhere) FAILS, never a silent no-grant.
+          local _names="$name"
+          if [ "$name" = "all" ]; then
+            _names="$(_list_all_skills)"
+            [ -n "$_names" ] || die "--with skills=all: NO skills were found in any searched home (~/.claude/skills, the plugin caches, and the parity dir), so the grant expands to nothing. An empty skills grant must never dispatch silently. Install the skill(s), name them explicitly, or drop the grant."
+          fi
+          local _one
+          while IFS= read -r _one; do
+          [ -n "$_one" ] || continue
+          f="$(_resolve_skill_file "$_one")"
           if [ -n "$f" ] && [ -f "$f" ]; then
             # Bound the injection. A SKILL.md can be ~100KB; pasting several verbatim buys latency and
             # spend on every single delegation, and on a lane that emits nothing until it finishes, a
@@ -3848,28 +4398,36 @@ build_with_preamble() {
             _sz=$(wc -c < "$f" 2>/dev/null || echo 0)
             if [ "$_sz" -gt "$_cap" ]; then
               printf '>>> [with] skill %s is %sb; injecting the first %sb only (raise with OSRC_WITH_MAX_BYTES). Full file: %s\n' \
-                "$name" "$_sz" "$_cap" "$f" >&2
+                "$_one" "$_sz" "$_cap" "$f" >&2
               out="$out
-=== INJECTED SKILL: $name (TRUNCATED to ${_cap}b of ${_sz}b; full file readable at $f) ===
+=== INJECTED SKILL: $_one (TRUNCATED to ${_cap}b of ${_sz}b; full file readable at $f) ===
 $(head -c "$_cap" "$f")
-=== END SKILL: $name ==="
+=== END SKILL: $_one ==="
             else
               out="$out
-=== INJECTED SKILL: $name ===
+=== INJECTED SKILL: $_one ===
 $(cat "$f")
-=== END SKILL: $name ==="
+=== END SKILL: $_one ==="
             fi
           else
-            # Say it on stderr too. Buried inside the prompt, a NOT FOUND note is read by the delegate
-            # and by nobody else, so the caller never learns the capability did not arrive.
-            printf '>>> [with] skill %s NOT FOUND (looked in ~/.claude/skills, the plugin caches, and the parity dir). The delegate is running WITHOUT it.\n' "$name" >&2
-            out="$out
-(injected skill '$name' NOT FOUND)"
+            # A requested capability that cannot resolve FAILS the dispatch - never a buried
+            # in-prompt note the caller never reads.
+            die "--with skills=$_one: skill NOT FOUND (looked in ~/.claude/skills, the plugin caches, and the parity dir). A requested capability that cannot resolve FAILS the dispatch - the delegate must never run while its prompt claims a grant that did not arrive. Install the skill, or drop it from the grant."
           fi
-        done ;;
+          done <<_OSRC_INLINE_ONES
+$_names
+_OSRC_INLINE_ONES
+        done <<_OSRC_INLINE_NAMES
+$(printf '%s' "$val" | tr ',' '\n')
+_OSRC_INLINE_NAMES
+        ;;
     esac
-  done
-  [ -n "$out" ] && printf 'You have been granted the following capability docs; use them as needed.\n%s\n' "$out"
+  done <<_OSRC_INLINE_SPECS
+$(_with_specs)
+_OSRC_INLINE_SPECS
+  [ -n "$out" ] && WITH_PRE_OUT="You have been granted the following capability docs; use them as needed.
+$out"
+  return 0
 }
 
 # build_mcp_flags_cc -> populates the global array CC_MCP_FLAGS with claude --strict-mcp-config /
@@ -3889,8 +4447,9 @@ $(cat "$f")
 #     Auth survives (verified live: haiku answers PONG with the empty strict config on the OAuth
 #     path, no --bare needed). This is the I1 PARITY STANDARD for the claude harness.
 #   - --with mcp=a,b: extract ONLY the named servers from ~/.claude.json into a temp config and
-#     strict-load just those (the original opt-in behavior, unchanged). jq failure = die (the user
-#     asked for specific servers; silent empty-config would be a misleading no-op).
+#     strict-load just those. Repeated mcp= specs (--with mcp=a --with mcp=b, or mcp=a mcp=b in
+#     one spec string) COMBINE into one requested set - never last-spec-wins. jq failure = die
+#     (the user asked for specific servers; silent empty-config would be a misleading no-op).
 #   - OSRC_CLAUDE_USER_CONFIG=1: escape hatch — CC_MCP_FLAGS=() so claude loads its full default
 #     MCP surface (interactive-style; use only when you deliberately want the live config).
 # The temp config is secret-bearing: created with umask 077 + chmod 600 and removed on script exit
@@ -3903,29 +4462,54 @@ build_mcp_flags_cc() {
   _mkdir_private "$OSRC_HOME" || { echo "ERROR: isolation setup: cannot mkdir OSRC_HOME ($OSRC_HOME)" >&2; return 1; }
   chmod 700 "$OSRC_HOME" 2>/dev/null || true
   local cfg="$OSRC_HOME/with-mcp-$$.json"
-  # --with mcp=a,b -> extract ONLY the named servers (original opt-in path, unchanged).
-  if [ -n "${WITH_SPEC:-}" ] && printf '%s' "$WITH_SPEC" | grep -q 'mcp=' && have jq; then
-    local tok mspec=""
-    _words_noglob "$WITH_SPEC"
-    for tok in ${WORDS[@]+"${WORDS[@]}"}; do case "$tok" in mcp=*) mspec="${tok#mcp=}" ;; esac; done
-    if [ -n "$mspec" ]; then
-      local cj="$HOME/.claude.json"
-      if [ -f "$cj" ]; then
-        local old_umask; old_umask="$(umask)"; umask 077
-        if jq -c --arg names "$mspec" '
-          ((.mcpServers // {}) + (reduce ((.projects//{})|to_entries[]) as $p ({}; . + (($p.value.mcpServers)//{})))) as $all
-          | {mcpServers: ($all | with_entries(select(.key as $k | ($names|split(",")|index($k)) != null)))}
-        ' "$cj" > "$cfg" 2>/dev/null; then
-          chmod 600 "$cfg" 2>/dev/null || true
-          umask "$old_umask"
-          CC_MCP_FLAGS=(--strict-mcp-config --mcp-config "$cfg")
-          return 0
-        fi
-        umask "$old_umask"
-        echo "ERROR: isolation setup: jq filter of ~/.claude.json failed (--with mcp=$mspec); aborting to avoid silent no-isolation" >&2
+  # --with mcp=a,b -> extract ONLY the named servers, and verify EVERY one resolved. A requested
+  # server that is absent from ~/.claude.json used to produce an empty-but-valid config and rc=0:
+  # the delegate launched WITHOUT the granted capability and nobody was told. Fail BEFORE launch.
+  local mspec=""
+  if [ -n "${WITH_SPEC:-}" ]; then
+    # EVERY mcp= spec counts: repeated flags (_consume_flags appends, so --with mcp=a --with mcp=b
+    # arrives as two specs) grant BOTH servers. Joining all specs into one comma-separated set and
+    # letting the presence check below verify every requested server fixes the old tail -1, which
+    # silently dropped every earlier granted server while reporting rc=0.
+    mspec="$(_with_specs | while IFS= read -r _sp; do case "$_sp" in mcp=*) printf '%s,' "${_sp#mcp=}" ;; esac; done)"
+    # normalize: trim each comma-separated name (a spaced list like mcp=a, b must match exactly),
+    # deduping first-seen (exact spelling preserved).
+    [ -n "$mspec" ] && mspec="$(printf '%s' "$mspec" | tr ',' '\n' | while IFS= read -r _n; do
+      _n="${_n#"${_n%%[![:space:]]*}"}"; _n="${_n%"${_n##*[![:space:]]}"}"
+      [ -n "$_n" ] || continue
+      case ",${_seen:-}," in *",$_n,"*) continue ;; esac
+      _seen="${_seen:-}$_n,"; printf '%s,' "$_n"
+    done)" && mspec="${mspec%,}"
+  fi
+  if [ -n "$mspec" ]; then
+    have jq || { echo "ERROR: --with mcp=$mspec needs jq to build the filtered strict config; refusing to launch with the MCP grant silently absent." >&2; return 1; }
+    local cj="$HOME/.claude.json"
+    [ -f "$cj" ] || { echo "ERROR: --with mcp=$mspec: no ~/.claude.json to resolve the named server(s) from; refusing to launch with the MCP grant silently absent." >&2; return 1; }
+    local old_umask; old_umask="$(umask)"; umask 077
+    if jq -c --arg names "$mspec" '
+      ((.mcpServers // {}) + (reduce ((.projects//{})|to_entries[]) as $p ({}; . + (($p.value.mcpServers)//{})))) as $all
+      | {mcpServers: ($all | with_entries(select(.key as $k | ($names|split(",")|index($k)) != null)))}
+    ' "$cj" > "$cfg" 2>/dev/null; then
+      chmod 600 "$cfg" 2>/dev/null || true
+      umask "$old_umask"
+      local _sn _miss=""
+      while IFS= read -r _sn; do
+        [ -n "$_sn" ] || continue
+        jq -e --arg k "$_sn" '.mcpServers | has($k)' "$cfg" >/dev/null 2>&1 || _miss="$_miss $_sn"
+      done <<_OSRC_MCP_NAMES
+$(printf '%s' "$mspec" | tr ',' '\n')
+_OSRC_MCP_NAMES
+      if [ -n "$_miss" ]; then
+        rm -f "$cfg"
+        echo "ERROR: --with mcp=$mspec: server(s) not found in ~/.claude.json:$_miss - refusing to launch with a partial MCP grant. Name the server(s) exactly as they appear in .mcpServers (or a project's mcpServers), or drop the grant." >&2
         return 1
       fi
+      CC_MCP_FLAGS=(--strict-mcp-config --mcp-config "$cfg")
+      return 0
     fi
+    umask "$old_umask"
+    echo "ERROR: isolation setup: jq filter of ~/.claude.json failed (--with mcp=$mspec); aborting to avoid silent no-isolation" >&2
+    return 1
   fi
   # DEFAULT (and fallback when --with mcp= has no match / no ~/.claude.json): empty strict MCP config.
   _emit_empty_mcp_cfg "$cfg" || return 1
@@ -3979,7 +4563,10 @@ _build_prompt() {
   local id="$1" task="$2" ttier="${3:-}" tier pre disc
   task="$(_effort_prompt "$task")"
   tier="$(resolve_tier "$id" "$ttier")"
-  pre="$(build_with_preamble)"; disc="$(_build_discipline)"
+  # Reuse the preamble the DELEGATE already rendered in-process (its dies fire in the delegate's own
+  # shell, not inside this $(...) capture). Render here only when the caller skipped that step.
+  [ "${WITH_PRE_RENDERED_FOR:-}" = "${WITH_SPEC:-}|${4:-inline}" ] || _with_preamble_render "${4:-}"
+  pre="$WITH_PRE_OUT"; disc="$(_build_discipline)"
   { [ -n "$pre" ] && printf '%s\n\n' "$pre"; [ -n "$disc" ] && printf '%s\n' "$disc"; wrap_prompt "$tier" "$task"; }
 }
 
@@ -12477,7 +13064,8 @@ delegate_cxnative() {
     dangerous)               sflag=(--dangerously-bypass-approvals-and-sandbox); posture="DANGER (no sandbox/approvals)" ;;
     *) die "bad tier: $tier" ;;
   esac
-  local ttier wrapped; ttier="$(resolve_tier "$id" "${TTIER:-}")"; wrapped="$(_build_prompt "$id" "$task" "${TTIER:-}")"
+  _with_preamble_render "bundle"   # in-process: an unhonorable --with grant dies HERE, not in a capture subshell
+  local ttier wrapped; ttier="$(resolve_tier "$id" "${TTIER:-}")"; wrapped="$(_build_prompt "$id" "$task" "${TTIER:-}" "bundle")"
   _tier_banner "codex-native" "$id" "$ttier" "$posture | $(_lane_cost_disclosure cx)"
   # SELF-HEAL (bidirectional): codex ships the `code_mode_host` feature ON, but if its host binary
   # is not installed, every file-reading tool call routes through a missing helper and HANGS. Force
@@ -12600,7 +13188,8 @@ delegate_ccnative() {
   local bare=() load_note="OAuth login, MCP ISOLATED (strict-empty; --with mcp= / OSRC_CLAUDE_USER_CONFIG=1 to load)"
   if [ -n "${ANTHROPIC_API_KEY:-}" ]; then bare=(--bare); load_note="clean (--bare, API key auth, no MCP surface)";
   elif [ "${OUTSOURCERER_LOADED:-0}" = "1" ]; then load_note="LOADED, full CLAUDE.md + skills (MCP still isolated; --with mcp= / OSRC_CLAUDE_USER_CONFIG=1 to load)"; fi
-  local ttier wrapped; ttier="$(resolve_tier "$id" "${TTIER:-}")"; wrapped="$(_build_prompt "$id" "$task" "${TTIER:-}")"
+  _with_preamble_render "bundle+mcp"   # in-process: an unhonorable --with grant dies HERE, not in a capture subshell
+  local ttier wrapped; ttier="$(resolve_tier "$id" "${TTIER:-}")"; wrapped="$(_build_prompt "$id" "$task" "${TTIER:-}" "bundle+mcp")"
   # Inside Claude Code a native subagent (Agent tool) can also run a Claude model IN-session, BUT its
   # per-invocation model can SILENTLY fall back to your default (usually Opus) with NO way to verify.
   # This lane instead runs a fresh, ENV-CLEANED `claude -p --model $id` and VERIFIES the model actually
@@ -12796,7 +13385,8 @@ delegate_gmnative() {
       die "Gemini lane needs a CLI. PRIMARY (keyless): install Antigravity CLI using https://antigravity.google/docs/cli/install/, then open Antigravity and sign in once so 'agy' inherits your login. FALLBACK (API key): npm install -g @google/gemini-cli + add GEMINI_API_KEY to ~/.env (https://aistudio.google.com/apikey)."
     fi
   fi
-  local ttier wrapped; ttier="$(resolve_tier "$id" "${TTIER:-}")"; wrapped="$(_build_prompt "$id" "$task" "${TTIER:-}")"
+  _with_preamble_render "bundle"   # in-process: an unhonorable --with grant dies HERE, not in a capture subshell
+  local ttier wrapped; ttier="$(resolve_tier "$id" "${TTIER:-}")"; wrapped="$(_build_prompt "$id" "$task" "${TTIER:-}" "bundle")"
   # Effort is NATIVE on agy (it takes --effort and refuses to run without one for these models) and
   # ADVISORY on gemini-cli, which still has no knob. The shared prompt keeps effort visible to both.
   if [ -n "$EFFORT" ] && [ "$vehicle" != "agy" ]; then
@@ -12947,7 +13537,8 @@ delegate_claudex() {
     dangerous)    mode="bypassPermissions"; posture="DANGER (bypasses ALL permission checks, no sandbox)" ;;
     *) die "bad tier: $tier" ;;
   esac
-  local ttier wrapped; ttier="$(resolve_tier "$id" "${TTIER:-}")"; wrapped="$(_build_prompt "$id" "$task" "${TTIER:-}")"
+  _with_preamble_render "bundle+mcp"   # in-process: an unhonorable --with grant dies HERE, not in a capture subshell
+  local ttier wrapped; ttier="$(resolve_tier "$id" "${TTIER:-}")"; wrapped="$(_build_prompt "$id" "$task" "${TTIER:-}" "bundle+mcp")"
   _tier_banner "claudex (Claude harness -> CLIProxyAPI)" "$id" "$ttier" "$posture | $(_lane_cost_disclosure claudex) through your local proxy"
   # Honest one-time-per-run caveat: unofficial bridge, upstream endpoints are internal/unstable,
   # heavy use without rate limiting has triggered upstream account limits for some users.
@@ -13026,7 +13617,8 @@ delegate_droid() {
   if [ -n "$EFFORT" ]; then local de; de="$(_droid_effort "$EFFORT")"
     [ -n "$de" ] && { eff=(-r "$de"); printf '>>> [effort] reasoning=%s (native: droid exec -r %s)\n' "$EFFORT" "$de" >&2; }; fi
   local ttier; ttier="$(resolve_tier "$model_key" "${TTIER:-}")" || ttier="capable"
-  local wrapped; wrapped="$(_build_prompt "$model_key" "$task" "$ttier")"
+  _with_preamble_render "bundle"   # in-process: an unhonorable --with grant dies HERE, not in a capture subshell
+  local wrapped; wrapped="$(_build_prompt "$model_key" "$task" "$ttier" "bundle")"
   _tier_banner "droid (Factory)" "$id" "$ttier" "$posture | $(_lane_cost_disclosure droid)"
   local rc=0 _lerr; _lerr="$(_lane_errfile)"
   _run_tee_stderr "$_lerr" droid exec ${mflag[@]+"${mflag[@]}"} ${aflag[@]+"${aflag[@]}"} ${eff[@]+"${eff[@]}"} -o text "$wrapped" || rc=$?
@@ -13057,7 +13649,8 @@ delegate_cursor() {
   if [ "${MODEL_EXPLICIT:-0}" = "1" ] && [ -n "$id" ]; then _validate_model_token "$id"; mflag=(--model "$id"); else id="(cursor default/configured)"; fi
   [ -n "$EFFORT" ] && printf '>>> [effort] reasoning=%s (advisory only: cursor-agent has no effort flag; folded into the prompt)\n' "$EFFORT" >&2
   local ttier; ttier="$(resolve_tier "${MODEL:-}" "${TTIER:-}")" || ttier="capable"
-  local wrapped; wrapped="$(_build_prompt "${MODEL:-cursor}" "$task" "$ttier")"
+  _with_preamble_render "bundle"   # in-process: an unhonorable --with grant dies HERE, not in a capture subshell
+  local wrapped; wrapped="$(_build_prompt "${MODEL:-cursor}" "$task" "$ttier" "bundle")"
   _tier_banner "cursor-agent" "$id" "$ttier" "$posture | $(_lane_cost_disclosure cursor)"
   local rc=0 _lerr; _lerr="$(_lane_errfile)"
   _run_tee_stderr "$_lerr" "$cur" -p "$wrapped" ${mflag[@]+"${mflag[@]}"} ${fflag[@]+"${fflag[@]}"} --trust --output-format text || rc=$?
@@ -13107,7 +13700,8 @@ delegate_hermes() {
   # Isolated git worktree when the caller asked for one (`-w` is a hermes global flag).
   local wflag=(); [ "${OSRC_WORKTREE:-0}" = "1" ] && wflag=(-w)
   local ttier; ttier="$(resolve_tier "${MODEL:-}" "${TTIER:-}")" || ttier="capable"
-  local wrapped; wrapped="$(_build_prompt "${MODEL:-hermes}" "$task" "$ttier")"
+  _with_preamble_render "bundle"   # in-process: an unhonorable --with grant dies HERE, not in a capture subshell
+  local wrapped; wrapped="$(_build_prompt "${MODEL:-hermes}" "$task" "$ttier" "bundle")"
   _tier_banner "hermes (NousResearch)" "$id" "$ttier" "$posture | $(_lane_cost_disclosure hermes)"
   local _fg_launch; _fg_launch="$(date +%s)"   # launch epoch for the Hermes receipt lookup
   local rc=0
@@ -13163,7 +13757,8 @@ delegate_warp() {
   else id="(warp default/configured)"; fi
   [ -n "$EFFORT" ] && printf '>>> [effort] reasoning=%s (advisory only: oz agent run has no effort flag; folded into the prompt)\n' "$EFFORT" >&2
   local ttier; ttier="$(resolve_tier "$model_key" "${TTIER:-}")" || ttier="capable"
-  local wrapped; wrapped="$(_build_prompt "$model_key" "$task" "$ttier")"
+  _with_preamble_render "bundle"   # in-process: an unhonorable --with grant dies HERE, not in a capture subshell
+  local wrapped; wrapped="$(_build_prompt "$model_key" "$task" "$ttier" "bundle")"
   _tier_banner "warp (Oz agent)" "$id" "$ttier" "$posture | $(_lane_cost_disclosure warp)"
   local rc=0 _lerr; _lerr="$(_lane_errfile)"
   _run_tee_stderr "$_lerr" oz agent run -p "$wrapped" ${mflag[@]+"${mflag[@]}"} ${hflag[@]+"${hflag[@]}"} ${pflag[@]+"${pflag[@]}"} -C "$PWD" --output-format text || rc=$?
@@ -13294,7 +13889,8 @@ delegate_cline() {
   if [ -n "$EFFORT" ]; then local ce; ce="$(_cline_effort "$EFFORT")"
     [ -n "$ce" ] && { eff=(--thinking "$ce"); printf '>>> [effort] reasoning=%s (native: cline --thinking %s)\n' "$EFFORT" "$ce" >&2; }; fi
   local ttier; ttier="$(resolve_tier "${MODEL:-}" "${TTIER:-}")" || ttier="capable"
-  local wrapped; wrapped="$(_build_prompt "${MODEL:-cline}" "$task" "$ttier")"
+  _with_preamble_render "bundle"   # in-process: an unhonorable --with grant dies HERE, not in a capture subshell
+  local wrapped; wrapped="$(_build_prompt "${MODEL:-cline}" "$task" "$ttier" "bundle")"
   _tier_banner "cline (Cline CLI)" "$id" "$ttier" "$posture, bills your ClinePass subscription or the keys configured in ~/.cline"
   local rc=0 _lerr; _lerr="$(_lane_errfile)"
   _run_tee_stderr "$_lerr" cline ${pflag[@]+"${pflag[@]}"} ${mflag[@]+"${mflag[@]}"} ${eff[@]+"${eff[@]}"} "$wrapped" || rc=$?
@@ -13810,12 +14406,15 @@ _secret_scan() {
   # `${_ws[@]:-}` is required: a whitespace-only spec yields an empty array, and "${_ws[@]}" on an
   # empty array is a fatal unbound-variable error under bash 3.2 + set -u.
   if [ -n "${WITH_SPEC:-}" ]; then
-    local tok; local -a _ws; IFS=' ' read -ra _ws <<< "$WITH_SPEC"
-    for tok in "${_ws[@]:-}"; do
+    local tok
+    while IFS= read -r tok; do
+      [ -n "$tok" ] || continue
       case "$tok" in *=*) continue ;; esac          # skills=a,b / mcp=x are not file paths
       [ -f "$tok" ] && scan="$scan
 $(cat "$tok" 2>/dev/null)"
-    done
+    done <<_OSRC_GATE_SPECS
+$(_with_specs)
+_OSRC_GATE_SPECS
   fi
   # Count distinct high-signal matches; do NOT retain the matched secret text (only a count is
   # surfaced downstream, so the raw credential fragments never live in a variable or reach stderr/logs).
@@ -13938,7 +14537,8 @@ delegate_cc() {
   local _fg_launch; _fg_launch="$(date +%s)"   # launch epoch for fg cost resolution
   for m in $(_or_chain "$tier"); do
     ttier="$(resolve_tier "$m" "")"
-    wrapped="$(_build_prompt "$m" "$prompt" "")"
+    _with_preamble_render "bundle+mcp"   # in-process: an unhonorable --with grant dies HERE, not in a capture subshell
+    wrapped="$(_build_prompt "$m" "$prompt" "" "bundle+mcp")"
     _tier_banner "cc-openrouter" "$m" "$ttier" "$posture | env: $load_note"
     # Use an explicit `env` array so MAX_THINKING_TOKENS can be appended CONDITIONALLY. A
     # ${think:+VAR=val} prefix does NOT work: bash only treats literal WORD=WORD tokens as
@@ -14092,7 +14692,8 @@ delegate_local() {
   if [ "$tier" != "auto" ] || [ "${OSRC_LOCAL_AGENTIC:-0}" = "1" ]; then
     _local_agentic "$tier" "$base" "$model"; return $?
   fi
-  local ttier wrapped; ttier="$(resolve_tier "$model" "${TTIER:-}")"; wrapped="$(_build_prompt "$model" "$task" "${TTIER:-}")"
+  _with_preamble_render "text"   # in-process: an unhonorable --with grant dies HERE, not in a capture subshell
+  local ttier wrapped; ttier="$(resolve_tier "$model" "${TTIER:-}")"; wrapped="$(_build_prompt "$model" "$task" "${TTIER:-}" "text")"
   _tier_banner "local ($base)" "$model" "$ttier" "TEXT delegation | PRIVATE: on YOUR hardware, $(_lane_cost_disclosure local), nothing leaves your machine"
   local jd="${OSRC_JOB_DIR:-$OSRC_HOME}"; mkdir -p "$jd"
   local capf="$jd/.local.$$.txt"; : > "$capf"
@@ -14150,7 +14751,8 @@ _local_agentic_codex() {
     dangerous)               sflag=(--dangerously-bypass-approvals-and-sandbox); posture="DANGER (no sandbox)" ;;
     *)                       sflag=(--sandbox read-only); posture="READ-ONLY sandbox" ;;
   esac
-  local ttier wrapped; ttier="$(resolve_tier "$model" "${TTIER:-}")"; wrapped="$(_build_prompt "$model" "${REST[*]}" "${TTIER:-}")"
+  _with_preamble_render "bundle"   # in-process: an unhonorable --with grant dies HERE, not in a capture subshell
+  local ttier wrapped; ttier="$(resolve_tier "$model" "${TTIER:-}")"; wrapped="$(_build_prompt "$model" "${REST[*]}" "${TTIER:-}" "bundle")"
   local cmh=(); cmh=(-c "features.code_mode_host=$(_codex_code_mode_host_flag)")
   local eff=(); [ -n "$EFFORT" ] && { eff=(-c "model_reasoning_effort=$EFFORT"); printf '>>> [effort] reasoning=%s (native)\n' "$EFFORT" >&2; }
   local sfx=(); [ "${OSRC_STREAM:-0}" = "1" ] && sfx=(--json --output-last-message "${OSRC_JOB_DIR:-$OSRC_HOME}/last.txt")
@@ -14196,7 +14798,8 @@ _local_agentic_shim() {
     local i; for i in $(seq 1 20); do curl -s -m 1 "$aurl/health" >/dev/null 2>&1 && break; sleep 0.5; done
     curl -s -m 1 "$aurl/health" >/dev/null 2>&1 || { [ -n "$shim_pid" ] && kill "$shim_pid" 2>/dev/null; die "shim did not become healthy at $aurl (upstream $base). Check python3 + the server."; }
   fi
-  local ttier mode wrapped; ttier="$(resolve_tier "$model" "${TTIER:-}")"; wrapped="$(_build_prompt "$model" "${REST[*]}" "${TTIER:-}")"
+  _with_preamble_render "bundle"   # in-process: an unhonorable --with grant dies HERE, not in a capture subshell
+  local ttier mode wrapped; ttier="$(resolve_tier "$model" "${TTIER:-}")"; wrapped="$(_build_prompt "$model" "${REST[*]}" "${TTIER:-}" "bundle")"
   case "$tier" in accept-edits|autonomous) mode=acceptEdits ;; dangerous) mode=bypassPermissions ;; *) mode=default ;; esac
   _tier_banner "local-agentic/shim ($aurl -> $base)" "$model" "$ttier" "AGENTIC via Claude Code | PRIVATE: on YOUR hardware, $(_lane_cost_disclosure local), nothing leaves your machine"
   local rc=0 sfx=(); [ "${OSRC_STREAM:-0}" = "1" ] && sfx=(--verbose --output-format stream-json)
@@ -14253,7 +14856,8 @@ delegate_tokenrouter() {
   # live). route_delegate enforces this before dispatch; this is the defense-in-depth backstop.
   [ -n "${MODEL:-}" ] || die "the tokenrouter lane needs -m <gateway-model-id> (no hardcoded default — list the gateway's catalog: curl -s -H 'Authorization: Bearer ***' $(_tr_base_url)/models)"
   local model="$MODEL"
-  local ttier wrapped; ttier="$(resolve_tier "$model" "${TTIER:-}")"; wrapped="$(_build_prompt "$model" "$task" "${TTIER:-}")"
+  _with_preamble_render "text"   # in-process: an unhonorable --with grant dies HERE, not in a capture subshell
+  local ttier wrapped; ttier="$(resolve_tier "$model" "${TTIER:-}")"; wrapped="$(_build_prompt "$model" "$task" "${TTIER:-}" "text")"
   _tier_banner "tokenrouter ($(_tr_base_url))" "$model" "$ttier" "TEXT delegation | CLOUD: $(_lane_cost_disclosure tokenrouter)"
   local jd="${OSRC_JOB_DIR:-$OSRC_HOME}"; mkdir -p "$jd"
   local capf="$jd/.tokenrouter.$$.txt"; : > "$capf"
@@ -14472,7 +15076,8 @@ delegate_codex() {
   local _or_iso=(); [ "${OSRC_CODEX_USER_CONFIG:-0}" = "1" ] || _or_iso=(--ignore-user-config)
   for m in $(_or_chain "$tier"); do
     ttier="$(resolve_tier "$m" "")"
-    wrapped="$(_build_prompt "$m" "$prompt" "")"
+    _with_preamble_render "bundle"   # in-process: an unhonorable --with grant dies HERE, not in a capture subshell
+    wrapped="$(_build_prompt "$m" "$prompt" "" "bundle")"
     _tier_banner "codex-openrouter" "$m" "$ttier" "$posture"
     # wire_api MUST be "responses" (Codex 0.144+ dropped chat completions); OpenRouter serves it.
     # Capture combined output (still shown via tee) so we can detect the tool-type 400 and self-heal.

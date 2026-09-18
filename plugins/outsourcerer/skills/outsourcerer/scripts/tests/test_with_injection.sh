@@ -5,7 +5,7 @@
 # PLUGIN (the entire ce-* family) lives in a versioned plugin cache instead, so it silently resolved to
 # "NOT FOUND", the note went into the PROMPT where only the delegate could read it, and the caller went on
 # believing the delegate had the skill. Delegations ran for a whole session without the capability they
-# were briefed to use, and nothing anywhere said so.
+# were briefed to use, and nothing anywhere said so. Today a missing skill FAILS the dispatch outright.
 #
 # The second half is size. A SKILL.md can be ~100KB. Pasting several verbatim buys latency and spend on
 # every delegation, and on a lane that prints nothing until it finishes, a bloated prompt is
@@ -82,11 +82,10 @@ case "$r_plug" in *2.0.0*) ok "the NEWEST plugin version wins, so an upgrade is 
 [ -z "$r_none" ] && ok "a genuinely missing skill still resolves to nothing" || bad "invented a path for a missing skill"
 
 # --- a capability that does NOT arrive must be reported to the CALLER, not only to the delegate ----
-err="$(WITH_SPEC="skills=definitely-not-a-skill" build_with_preamble 2>&1 >/dev/null)"
-case "$err" in *"NOT FOUND"*) ok "a missing skill is announced on stderr where the caller can see it" ;;
-  *) bad "a missing skill is still reported only inside the prompt" ;; esac
-case "$err" in *"WITHOUT it"*) ok "the warning states the delegate is running without the capability" ;;
-  *) bad "the warning does not say the delegate lacks the skill" ;; esac
+err="$(WITH_SPEC="skills=definitely-not-a-skill" build_with_preamble 2>&1 >/dev/null)"; rc=$?
+[ "$rc" -ne 0 ] && case "$err" in *"NOT FOUND"*) ok "a missing skill FAILS the dispatch, announced on stderr where the caller can see it" ;;
+  *) bad "missing-skill death not announced on stderr: $err" ;; esac
+[ "$rc" -ne 0 ] || bad "a missing skill still rendered rc=0 - the delegate would run without it"
 
 # --- injection must be bounded --------------------------------------------------------------------
 mkdir -p "$TMP/home/.claude/skills/huge"

@@ -25,7 +25,7 @@ You already pay for a fleet of AIs: Claude, Codex, Gemini, maybe Devin, a stack 
 
 ## It doesn't just call another model. It brings your whole workshop.
 
-When Outsourcerer hands a job to a different engine or harness, that engine doesn't show up empty-handed. It carries **your** setup with it: the same skills, the same plugins, the same MCP servers your main agent uses. A cheap model running on Devin can use your custom skill and reach your MCP tools exactly the way your Claude session would. It's the difference between borrowing a stranger's bare laptop and having your own, fully set up, wherever the work happens to run.
+When Outsourcerer hands a job to a different engine or harness, that engine doesn't show up empty-handed. Grant a skill and the delegate gets the skill's **whole bundle** - SKILL.md plus its references, scripts, and assets - staged on disk next to the job on tool-capable harnesses, and synced into the harness's skills home on Devin. Text-only lanes can't run scripts, so they get the skill's complete documentation serialized into the prompt, with every script and asset explicitly listed as NOT TRANSFERRED - and a grant that can't fit or resolve refuses the dispatch instead of arriving half-loaded. MCP servers come along when you ask for them (`--with mcp=`), on the Claude lanes today; anywhere a grant can't make the trip, Outsourcerer says so up front instead of letting the delegate pretend. It's the difference between borrowing a stranger's bare laptop and having your own, fully set up, wherever the work happens to run.
 
 ---
 
@@ -107,7 +107,7 @@ The models don't think alike, so Outsourcerer doesn't prompt them alike. The rig
 ## What you can ask it to do
 
 - **Offload the grind.** Repo mapping, mechanical refactors, running the test suite, big searches. Cheap model does it; your main agent stays the boss.
-- **Bring your setup along.** Hand the job your skills, plugins, and MCP servers so the delegate works with your tools, not a bare model, even on another harness.
+- **Bring your setup along.** Hand the job your skills (`--with skills=x`, or `all`) and the delegate works with the whole skill - docs, references, scripts - on tool-capable harnesses; text-only lanes get the complete docs with executables honestly marked NOT TRANSFERRED. MCP servers on request (`--with mcp=`), on the Claude lanes, verified present before launch.
 - **Convene advisors.** Have several stronger models review a plan or a diff in parallel, improve it, and only proceed on consensus.
 - **Run agents in parallel.** Fan out a whole multi-agent gauntlet (a QA sweep, a per-module review, N reviewers) across any backend at once with `fanout`, watch them live, and collect every finding into one file. No 16-session bootstrap tax.
 - **Generate images.** **GPT-image first** on your Codex plan (keyless, no API credits), then nano-banana or an OpenRouter image model. *(Every illustration in this README was rendered exactly this way, by Outsourcerer, keyless, `$0` cash.)*
@@ -198,7 +198,7 @@ Under the robe it's deliberately boring: a self-contained bash script you can re
 |---|:---:|:---:|:---:|
 | Shows you the money saved | ✗ | ✗ | ✅ the **Tab**, per lane, vs your frontier model |
 | Crosses *agents*, not just models | Claude only | model-swap inside one harness | **Codex · Antigravity · Claude Code · Devin** |
-| Carries your skills / plugins / MCP to the delegate | ✗ | ✗ | ✅ your whole setup, on any harness |
+| Carries your skills to the delegate | ✗ | ✗ | ✅ whole skill bundles on tool lanes; complete docs on text lanes (executables marked NOT TRANSFERRED); MCP on request (Claude lanes) |
 | Keyless on what you already pay for | Claude sub only | API keys | ✅ your existing subscriptions, or the API key of your choice |
 | Advisor panel + consensus | ✗ | ✗ | ✅ several top-tier models, act only when they agree |
 | Per-model prompting built in | ✗ | ✗ | ✅ tier-aware wrappers |
@@ -229,7 +229,7 @@ outsourcerer fanout status <id> --json      # squad state as a stable JSON envel
 outsourcerer fanout collect <id>            # every result in one place, then: outsourcerer cleanup <id>
 ```
 
-`--worktree` runs each editing specialist in its **own disposable git worktree** so parallel edits never collide; worktrees are preserved after the run (never auto-deleted), and `cleanup` refuses to bin one that has unmerged work unless you `--force`. Every job is watchdog-supervised so it ends **classified** (done / blocked / timed-out), carries your skills and MCP via `--with`, and lands on the **Tab**. You keep the persona, the decomposition, the merge policy; the sorcerer runs the fleet.
+`--worktree` runs each editing specialist in its **own disposable git worktree** so parallel edits never collide; worktrees are preserved after the run (never auto-deleted), and `cleanup` refuses to bin one that has unmerged work unless you `--force`. Every job is watchdog-supervised so it ends **classified** (done / blocked / timed-out), carries your skills via `--with` (MCP on the Claude lanes), and lands on the **Tab**. You keep the persona, the decomposition, the merge policy; the sorcerer runs the fleet.
 
 **On the roadmap:** **completion events** so the orchestrator wakes on a state change instead of polling, and a richer receipt (cost + branch/SHA) in that same JSON.
 

@@ -48,13 +48,18 @@ f() { _words_noglob 'p q'; printf '%s' "$#"; }
 ( _validate_with_token '*' ) >/dev/null 2>&1 && bad "--with '*' accepted in a cwd holding skills=planted (glob bypass)" || ok "--with '*' is rejected even when the cwd holds a skills=… file"
 _err="$( ( _validate_with_token '*' ) 2>&1 >/dev/null )"
 case "$_err" in *"got '*'"*) ok "the rejection names the literal spec, not a cwd filename" ;; *) bad "rejection names something else: $_err" ;; esac
-( _validate_with_token 'skills=*' ) >/dev/null 2>&1 && ok "a literal skills=* passes shape validation without touching the cwd" || bad "skills=* rejected"
+_gerr="$( ( _validate_with_token 'skills=*' ) 2>&1 >/dev/null )"; _grc=$?
+[ "$_grc" -ne 0 ] && ok "a glob-char skill name dies at validation (skills=* cannot name a skill)" || bad "skills=* passed validation"
+case "$_gerr" in *"invalid name '*'"*) ok "the invalid-name rejection names the literal '*', never a cwd filename" ;; *) bad "invalid-name rejection wrong: $_gerr" ;; esac
 ( _validate_with_token ' ' ) >/dev/null 2>&1 && bad "a whitespace-only --with was accepted (silent no-op)" || ok "a whitespace-only --with is rejected"
 ( _validate_with_token '	' ) >/dev/null 2>&1 && bad "a tab-only --with was accepted" || ok "a tab-only --with is rejected"
 _werr="$( ( _validate_with_token '  ' ) 2>&1 >/dev/null )"
 case "$_werr" in *whitespace-only*) ok "the whitespace rejection says why" ;; *) bad "whitespace rejection message unclear: $_werr" ;; esac
 ( _validate_with_token 'skills=a,b mcp=x' ) >/dev/null 2>&1 && ok "a valid multi-token spec is still accepted" || bad "valid multi-token spec rejected"
-( _validate_with_token "$(printf 'skills=a\nmcp=x')" ) >/dev/null 2>&1 && ok "newline-separated valid tokens are accepted" || bad "newline-separated tokens rejected"
+_nlerr="$( ( _validate_with_token "$(printf 'skills=a\nmcp=x')" ) 2>&1 >/dev/null )"; _nlrc=$?
+[ "$_nlrc" -ne 0 ] && case "$_nlerr" in *CR/LF*) ok "a literal newline in a --with spec dies naming the CR/LF rule" ;;
+  *) bad "newline death wrong: $_nlerr" ;; esac
+[ "$_nlrc" -ne 0 ] || bad "a newline-bearing spec was accepted"
 ( _validate_with_token "$(printf 'skills=a\n/tmp/brief.txt')" ) >/dev/null 2>&1 && bad "a bad token after a newline slipped through" || ok "a bad token after a newline is still caught"
 
 # --- _secret_scan survives a whitespace-only WITH_SPEC (defence in depth) --------------------------
@@ -68,6 +73,21 @@ r="$(_route_match k1 'k*=fast, other=slow')"; rc=$?
 [ "$rc" -eq 0 ] && [ "$r" = fast ] && ok "--route multi-pair list with spaces still matches" || bad "--route multi-pair failed (rc=$rc, got '$r')"
 _route_match nomatch 'gemini-3.5-*=glm' >/dev/null 2>&1 && bad "--route matched a label it should not" || ok "--route non-match still returns 1"
 case "$-" in *f*) bad "_route_match left globbing disabled" ;; *) ok "_route_match restores the caller's glob state" ;; esac
+
+# --- malformed comma lists FAIL, never silently normalize -------------------------------------------
+# "mcp=one," used to return rc=0 having dropped the empty member: the grant written and the grant
+# honored disagreed. Leading, trailing, adjacent, and whitespace-only members all die, for skills
+# and mcp alike; a spaced list of real members stays legal.
+for _spec in 'skills=,a' 'skills=a,' 'skills=a,,b' 'skills=a, ,b' \
+             'mcp=,a' 'mcp=one,' 'mcp=a,,b' 'mcp=a, ,b' 'mcp=a, '; do
+  ( _validate_with_token "$_spec" ) >/dev/null 2>&1 \
+    && bad "malformed list accepted: $_spec" || ok "malformed list dies: $_spec"
+done
+_err="$( ( _validate_with_token 'mcp=one,' ) 2>&1 >/dev/null )"
+case "$_err" in *malformed*"empty member"*) ok "the malformed-list death says why" ;;
+  *) bad "malformed-list message wrong: $_err" ;; esac
+( _validate_with_token 'mcp=a, b' ) >/dev/null 2>&1 \
+  && ok "a spaced list with non-empty members stays legal" || bad "a legal spaced list was refused"
 
 cd "$TMP"
 echo "PASS=$pass FAIL=$fail"
