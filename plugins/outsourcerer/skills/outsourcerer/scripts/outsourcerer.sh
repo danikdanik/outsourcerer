@@ -2203,12 +2203,28 @@ _skill_tree_names_safe() {
 # (released by the EXIT trap) spans the delegate's whole run: no two grant sets ever overlap on
 # the shared home. mkdir is the portable atomic (no flock on macOS); a holder that dies without
 # cleanup is detected via its recorded pid.
+# Sets _BASHPID to the CURRENT shell's OWN live pid — unique per subshell even on bash 3.2 (macOS),
+# where BASHPID does not exist and $$ keeps the parent's value in every subshell. It MUST set a global
+# rather than print: a caller capturing it via $(...) would fork a command-substitution subshell, and
+# `sh -c 'echo $PPID'` there reports THAT ephemeral fork's pid — unstable across calls AND already dead,
+# so the lock's stale-holder detection (kill -0) would treat a live lock as abandoned and steal it. Run
+# directly (no $()), `sh` is a child of THIS shell, so $PPID is our real, stable, live pid. This is what
+# makes the Devin skills-home grant lock actually serialize concurrent dispatches on stock macOS.
+_bashpid_into() {
+  if [ -n "${BASHPID:-}" ]; then _BASHPID="$BASHPID"; return; fi
+  local _tf; _tf="$(mktemp "${TMPDIR:-/tmp}/.osrc-pid.XXXXXX" 2>/dev/null)" || _tf="${TMPDIR:-/tmp}/.osrc-pid.$$.$RANDOM"
+  sh -c 'echo $PPID' > "$_tf" 2>/dev/null
+  _BASHPID=""; read -r _BASHPID < "$_tf" 2>/dev/null; rm -f "$_tf" 2>/dev/null
+  [ -n "$_BASHPID" ] || _BASHPID="$$"
+}
+
 _DEVIN_LOCK_DIR=""
 _devin_skills_lock_acquire() {
   local dst="$HOME/.config/devin/skills" lock="$dst/.outsourcerer-grants.lock.d" owner tries=0
-  # Ownership key: BASHPID (differs per subshell; $$ does not, which would let two backgrounded
-  # prepares through "together" or deadlock a sequential one). Falls back to $$ on bash 3.2.
-  local me="${BASHPID:-$$}"
+  # Ownership key: this subshell's own live pid (see _bashpid_into) — $$ alone does not differ per
+  # subshell on bash 3.2, which would let two backgrounded prepares through "together" or deadlock a
+  # sequential one.
+  _bashpid_into; local me="$_BASHPID"
   local max="${OSRC_DEVIN_LOCK_WAIT_MAX:-1800}"; case "$max" in ''|*[!0-9]*) max=1800 ;; esac
   mkdir -p "$dst" 2>/dev/null || die "--with: cannot create $dst for the Devin grant lock."
   # Re-entrant: one process may prepare repeatedly (tests, multi-grant flows) without deadlocking
@@ -2229,7 +2245,8 @@ _devin_skills_lock_acquire() {
 }
 _devin_skills_lock_release() {
   [ -n "$_DEVIN_LOCK_DIR" ] && [ -d "$_DEVIN_LOCK_DIR" ] || return 0
-  [ "$(cat "$_DEVIN_LOCK_DIR/pid" 2>/dev/null)" = "${BASHPID:-$$}" ] && rm -rf "$_DEVIN_LOCK_DIR" 2>/dev/null
+  _bashpid_into
+  [ "$(cat "$_DEVIN_LOCK_DIR/pid" 2>/dev/null)" = "$_BASHPID" ] && rm -rf "$_DEVIN_LOCK_DIR" 2>/dev/null
   _DEVIN_LOCK_DIR=""
 }
 

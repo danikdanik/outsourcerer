@@ -605,10 +605,14 @@ ln -s 'SKILL.md' "$RSK/root-link"
   && ok "relative in-tree links (incl. nested and .. forms) stage fine" \
   || bad "relative in-tree links were refused"
 staged_ok=1
+# Canonicalize the baseline the SAME way _canon_path canonicalizes the link (pwd -P resolves every
+# symlink, incl. macOS /var -> /private/var), or an in-tree link reads as an escape purely because
+# one side kept the /var spelling and the other the /private/var spelling.
+staged_root_canon="$(_canon_path "$OSRC_HOME/sb-rel/relskill")"
 while IFS= read -r sl; do
   [ -n "$sl" ] || continue
   canon="$(_canon_path "$(dirname "$sl")/$(readlink "$sl")")"
-  case "$canon" in "$OSRC_HOME/sb-rel/relskill"|"$OSRC_HOME/sb-rel/relskill"/*) ;;
+  case "$canon" in "$staged_root_canon"|"$staged_root_canon"/*) ;;
     *) staged_ok=0; bad "STAGED link escapes the staged root: $sl -> $(readlink "$sl")" ;; esac
 done <<_OSRC_STAGED_LINKS
 $(find "$OSRC_HOME/sb-rel/relskill" -type l 2>/dev/null)
