@@ -147,7 +147,7 @@ set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 # Version identifier. Single source of truth; bump the rightmost
 # number for patch releases. `doctor` and `--version` both read this.
-OSRC_VERSION="0.13.0"
+OSRC_VERSION="0.13.2"
 DEFAULT_MODEL="${OUTSOURCERER_MODEL:-glm-5.2}"
 
 # ---- platform detection (mac | linux | windows-gitbash). Windows = Git Bash / MSYS2, NO WSL
@@ -831,7 +831,12 @@ _lane_free_probe() {
 _devin_plan_probe_model() {
   local refused probe alt
   refused="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | tr '._' '--')"
-  probe="${OSRC_DEVIN_PROBE_MODEL:-glm-5-2}"; alt="${OSRC_DEVIN_PROBE_MODEL_ALT:-swe-1-7}"
+  # The alt probe is swe-2, NOT swe-1-7. swe-1-7 shares the same daily plan bucket as glm/kimi, so
+  # probing it after a glm refusal just re-confirms the bucket is spent. swe-2 is a SEPARATE Free tier
+  # (Devin catalog cost_tier=Free; verified live 2026-09-18: swe-2 answered while glm-5-2 was daily-
+  # capped) — so probing it discovers whether free work can still run on the lane, which is the whole
+  # point of the "one refusal does not prove every model is spent" check.
+  probe="${OSRC_DEVIN_PROBE_MODEL:-glm-5-2}"; alt="${OSRC_DEVIN_PROBE_MODEL_ALT:-swe-2}"
   if [ "$(printf '%s' "$probe" | tr '[:upper:]' '[:lower:]' | tr '._' '--')" = "$refused" ]; then probe="$alt"; fi
   printf '%s' "$probe"
 }
@@ -1018,9 +1023,12 @@ _devin_resolve_dynamic() {
 # These do NOT draw on the separate paid ACU balance, so a "0% remaining" figure in Devin's own output
 # (which reports that paid balance) must never be read as blocking them. This is the bug-1 anchor:
 # free-tier models must run regardless of the paid-quota display.
+# swe-2 is added because Devin's live catalog marks it cost_tier="Free" (its own separate tier, outside
+# the shared glm/swe-1.7/kimi daily plan bucket). It was previously unrecognized, so a swe-2 dispatch —
+# the escape when the shared bucket is spent — was treated as a paid model.
 _devin_is_free_model() {
   case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
-    glm|glm-5.2|glm-5-2|z-ai/glm-5.2|glm-5.3*|glm-5-3*|z-ai/glm-5.3*|swe|swe-1.7|swe-1-7|swe-1.7-lightning|deepseek|deepseek-v4-pro|deepseek/deepseek-v4-pro|kimi|kimi-k3) return 0 ;;
+    glm|glm-5.2|glm-5-2|z-ai/glm-5.2|glm-5.3*|glm-5-3*|z-ai/glm-5.3*|swe-2|swe-2-high|swe-2-medium|swe-2-max|swe|swe-1.7|swe-1-7|swe-1.7-lightning|deepseek|deepseek-v4-pro|deepseek/deepseek-v4-pro|kimi|kimi-k3) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -10277,8 +10285,26 @@ _autodetach_should() {
 _autodetach_run() {
   local _ar_verb="$1"; shift
   _bg_cloud_preack "$_ar_verb" "$@"   # ack in the PARENT so a refusal `die`s the whole command (not just a subshell)
-  # HEADLESS BG PATH (explicit opt-out). Also the path the bg re-entry tests exercise.
+  # PATH SELECTION. Interactive tmux is the DEFAULT (OSRC_REQUIRE_INTERACTIVE=1), but it needs tmux.
+  # A host WITHOUT tmux (CI, sandboxes, most agent runners) used to hard-FAIL here — issue #35:
+  # "the delegate did not run because this machine lacks tmux". Refusing to run at all is worse than
+  # the supported headless path, so a slow-lane run that cannot open a tmux session now falls back to
+  # the HEADLESS BG path (the SAME watchdog/status/result supervision `bg` provides — not steerable).
+  # Opt out of the fallback with OSRC_REQUIRE_TMUX=1 to restore the old strict "install tmux or fail".
+  local _use_headless=0
   if [ "${OSRC_REQUIRE_INTERACTIVE:-1}" != "1" ]; then
+    _use_headless=1
+  elif ! have tmux; then
+    if [ "${OSRC_REQUIRE_TMUX:-0}" = "1" ]; then
+      die "auto-detach: tmux is not installed and OSRC_REQUIRE_TMUX=1 ($( [ "$OSRC_PLATFORM" = "mac" ] && echo 'brew install tmux' || echo 'apt/dnf install tmux')). Install tmux, or unset OSRC_REQUIRE_TMUX to allow the headless bg fallback, or set OSRC_REQUIRE_INTERACTIVE=0."
+    fi
+    _use_headless=1
+    printf '>>> [auto-detach] tmux is not installed. RECOMMENDED: install tmux (%s) — it is the basic requirement for steerable interactive `session` mode; without it you can run/fanout headless but cannot watch or steer a live delegate. Falling back to the HEADLESS bg path now (supervised via watchdog/status/result). Silence with OSRC_REQUIRE_INTERACTIVE=0; fail instead of falling back with OSRC_REQUIRE_TMUX=1.\n' \
+      "$( [ "$OSRC_PLATFORM" = "mac" ] && echo 'brew install tmux' || echo 'apt/dnf install tmux')" >&2
+  fi
+  # HEADLESS BG PATH (explicit opt-out, or the tmux-absent fallback above). Also the path the bg
+  # re-entry tests exercise.
+  if [ "$_use_headless" = "1" ]; then
     local id; id="$(_bg_launch "$_ar_verb" "$@")"
     [ -n "$id" ] || die "auto-detach: launch failed -- no job id was minted (nothing was started)."
     printf '>>> [auto-detach] non-interactive slow-lane run detached to bg to avoid a caller tool-timeout.\n' >&2
@@ -10288,10 +10314,8 @@ _autodetach_run() {
     echo "$id"
     return 0
   fi
-  # INTERACTIVE TMUX PATH (default). Route the would-be headless dispatch to a tmux session so a
-  # human can watch/steer it. Same machinery `session start` uses (new-session + send-keys). Never
-  # silently fall back to headless: if tmux is genuinely unavailable, FAIL LOUDLY with the reason.
-  have tmux || die "auto-detach: OSRC_REQUIRE_INTERACTIVE=1 but tmux is not installed ($( [ "$OSRC_PLATFORM" = "mac" ] && echo 'brew install tmux' || echo 'apt/dnf install tmux')). A non-interactive slow-lane run must NOT go headless. Set OSRC_REQUIRE_INTERACTIVE=0 to allow the headless bg path, or install tmux."
+  # INTERACTIVE TMUX PATH (default, tmux confirmed present above). Route the would-be headless dispatch
+  # to a tmux session so a human can watch/steer it. Same machinery `session start` uses.
   # Unique per-run session name (collision-safe for concurrent auto-detaches in the same directory;
   # the PWD-derived SESSION_NAME is one-per-dir). OUTSOURCERER_TMUX overrides SESSION_NAME at source
   # time, so the user steers via:  OUTSOURCERER_TMUX=<name> $0 session read | session send "..." | session stop

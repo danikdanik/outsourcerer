@@ -2,6 +2,14 @@
 
 All notable changes to the Outsourcerer plugin are documented here.
 
+## 0.13.2
+
+### Fixed
+
+- **A daily-capped GLM no longer strands free work — the plan-quota probe now checks `swe-2`.** When Devin's shared daily plan bucket (glm/swe-1.7/kimi) is spent, the "one refusal does not prove every plan-included model is spent" probe was checking `swe-1-7`, which shares that same bucket — so it just re-confirmed exhaustion and marked the lane down. It now probes **`swe-2`**, a *separate* Free tier (Devin catalog `cost_tier=Free`; verified live: `swe-2` answered while `glm-5-2` was daily-capped). So free work keeps running on the lane via the model that actually still answers. Override with `OSRC_DEVIN_PROBE_MODEL_ALT`.
+- **`swe-2` is now recognized as a free/plan-included model.** It was absent from `_devin_is_free_model`, so a `swe-2` dispatch — the escape when the shared bucket is spent — was treated as a paid model (wrong cost disclosure, no free-tier mis-gate protection).
+- **A tmux-less host no longer refuses to run (issue #35).** A non-interactive slow-lane auto-detach used to hard-fail when `tmux` was absent (CI, sandboxes, agent runners). It now falls back to the supervised headless bg path and recommends installing tmux for steerable sessions. Restore the strict behavior with `OSRC_REQUIRE_TMUX=1`.
+
 ## 0.13.0
 
 When the harness a job is running on hits **its own plan limit** mid-job, Outsourcerer now verifies

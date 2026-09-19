@@ -270,13 +270,15 @@ echo "=== (d) OSRC_NO_AUTODETACH=1 → foreground, no tmux, no bg job ==="
 }
 
 echo ""
-echo "=== (e) Structural: have tmux || die gate present in source ==="
+echo "=== (e) Structural: tmux-absent falls back to headless + recommends install (issue #35) ==="
 {
-  # The die-loudly check for tmux-unavailable must be in the auto-detach interactive path.
-  if grep -q 'have tmux || die.*OSRC_REQUIRE_INTERACTIVE' "$ENGINE"; then
-    ok "(e) structural: have tmux || die gate present (tmux-unavailable dies loudly)"
+  # Issue #35: a host WITHOUT tmux must NOT hard-fail; the auto-detach path falls back to the headless
+  # bg path and RECOMMENDS installing tmux. The old strict "install tmux or die" is now opt-in via
+  # OSRC_REQUIRE_TMUX=1.
+  if grep -q 'OSRC_REQUIRE_TMUX' "$ENGINE" && grep -qi 'RECOMMENDED: install tmux' "$ENGINE"; then
+    ok "(e) structural: tmux-absent path recommends install + OSRC_REQUIRE_TMUX=1 opt-in to force die"
   else
-    no "(e) structural: have tmux || die gate missing from auto-detach interactive path"
+    no "(e) structural: tmux-absent fallback/recommendation gate missing"
   fi
 
   # OSRC_REQUIRE_INTERACTIVE must be referenced in _autodetach_run.

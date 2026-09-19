@@ -98,9 +98,9 @@ printf '%s' "$_out" | grep -q 'Devin says it resets in 11h26m' && ok "answered: 
 # === (c) refused model IS the default probe model -> probe a SIBLING, not the same model ==========
 refuse glm-5-2
 _out="$(_devin_plan_quota_block "$FX/daily" glm-5-2 'scope' 'advice' 2>&1)"
-[ "$(calls)" = "swe-1-7" ] && ok "sibling: glm-5-2 refused -> probe went to swe-1-7, not back to glm-5-2" || bad "sibling: devin calls were '$(calls)'"
-_lane_down_active dv && bad "sibling: lane down although swe-1-7 answered" || ok "sibling: lane stays up on the sibling's answer"
-[ "$(_devin_plan_probe_model glm-5.2)" = "swe-1-7" ] && ok "sibling: dotted alias glm-5.2 folds to the probe id (alt chosen)" || bad "sibling: got '$(_devin_plan_probe_model glm-5.2)'"
+[ "$(calls)" = "swe-2" ] && ok "sibling: glm-5-2 refused -> probe went to swe-2 (separate Free tier), not back to glm-5-2" || bad "sibling: devin calls were '$(calls)'"
+_lane_down_active dv && bad "sibling: lane down although swe-2 answered" || ok "sibling: lane stays up on the sibling's answer"
+[ "$(_devin_plan_probe_model glm-5.2)" = "swe-2" ] && ok "sibling: dotted alias glm-5.2 folds to the probe alt swe-2" || bad "sibling: got '$(_devin_plan_probe_model glm-5.2)'"
 [ "$(_devin_plan_probe_model kimi-k3)" = "glm-5-2" ] && ok "sibling: any other refused model probes the default glm-5-2" || bad "sibling: got '$(_devin_plan_probe_model kimi-k3)'"
 [ "$(OSRC_DEVIN_PROBE_MODEL=swe-1-7 OSRC_DEVIN_PROBE_MODEL_ALT=kimi-k3 _devin_plan_probe_model swe-1-7)" = "kimi-k3" ] && ok "sibling: probe/alt overridable via env" || bad "sibling: env override ignored"
 

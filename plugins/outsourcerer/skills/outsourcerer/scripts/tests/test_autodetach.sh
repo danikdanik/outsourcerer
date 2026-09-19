@@ -437,7 +437,7 @@ grep -q -- '--wait|--foreground) OSRC_NO_AUTODETACH=1' "$ENGINE" \
   && ok "structural: --wait/--foreground flag wired into _consume_flags" \
   || no "structural: --wait/--foreground flag missing from _consume_flags"
 
-grep -A5 '^_autodetach_run()' "$ENGINE" | grep -q '_bg_launch' \
+grep -A40 '^_autodetach_run()' "$ENGINE" | grep -q '_bg_launch' \
   && ok "structural: _autodetach_run reuses _bg_launch (existing bg machinery)" \
   || no "structural: _autodetach_run does not reuse _bg_launch"
 
