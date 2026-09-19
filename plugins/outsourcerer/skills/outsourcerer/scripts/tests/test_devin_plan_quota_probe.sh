@@ -48,6 +48,11 @@ export PATH="$FB:$PATH"
 [ "$(command -v devin)" = "$FB/devin" ] && ok "fixture: fake devin is first on PATH" || bad "fixture: PATH resolves devin to $(command -v devin)"
 refuse() { : > "$FAKE_DEVIN_REFUSE"; for m in "$@"; do printf '%s\n' "$m" >> "$FAKE_DEVIN_REFUSE"; done; : > "$FAKE_DEVIN_LOG"; }
 calls() { cat "$FAKE_DEVIN_LOG" 2>/dev/null | tr '\n' ' ' | sed 's/ $//'; }
+# The plan-quota-probe default alt is now discovered from the live catalog (a network refresh that
+# would call the fake devin and pollute `calls`). This suite tests the plan-quota logic with the known
+# swe-2 sibling, so pin the alt deterministically; the catalog-driven alt is covered by
+# test_devin_catalog_free_tier.sh.
+export OSRC_DEVIN_PROBE_MODEL_ALT=swe-2
 
 FX="$TMP/fx"; mkdir -p "$FX"
 printf 'Error: Your daily usage quota has been exhausted. It resets in 11h26m. See https://app.devin.ai/settings/usage\n' > "$FX/daily"

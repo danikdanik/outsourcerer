@@ -147,7 +147,7 @@ set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 # Version identifier. Single source of truth; bump the rightmost
 # number for patch releases. `doctor` and `--version` both read this.
-OSRC_VERSION="0.13.2"
+OSRC_VERSION="0.13.3"
 DEFAULT_MODEL="${OUTSOURCERER_MODEL:-glm-5.2}"
 
 # ---- platform detection (mac | linux | windows-gitbash). Windows = Git Bash / MSYS2, NO WSL
@@ -836,7 +836,11 @@ _devin_plan_probe_model() {
   # (Devin catalog cost_tier=Free; verified live 2026-09-18: swe-2 answered while glm-5-2 was daily-
   # capped) — so probing it discovers whether free work can still run on the lane, which is the whole
   # point of the "one refusal does not prove every model is spent" check.
-  probe="${OSRC_DEVIN_PROBE_MODEL:-glm-5-2}"; alt="${OSRC_DEVIN_PROBE_MODEL_ALT:-swe-2}"
+  # alt = a truly-Free model discovered from the live catalog (self-heals as Devin changes its Free
+  # tier), falling back to swe-2 (the known Free model) when the catalog is unavailable or the env
+  # override is unset.
+  probe="${OSRC_DEVIN_PROBE_MODEL:-glm-5-2}"
+  alt="${OSRC_DEVIN_PROBE_MODEL_ALT:-$(_devin_first_catalog_free_model)}"; alt="${alt:-swe-2}"
   if [ "$(printf '%s' "$probe" | tr '[:upper:]' '[:lower:]' | tr '._' '--')" = "$refused" ]; then probe="$alt"; fi
   printf '%s' "$probe"
 }
@@ -970,6 +974,46 @@ _devin_catalog_raw() {
   [ -f "$rawf" ] && cat "$rawf" 2>/dev/null
 }
 
+# The set of Devin models Devin's OWN live catalog marks cost_tier="Free" (canon-keyed, space-padded),
+# so the free tier self-heals as Devin adds/renames Free models instead of drifting behind a hardcoded
+# list. COST-SAFE: a bare family id counts only when EVERY variant in it is Free (a mixed family lists
+# just its Free variants), so a paid variant never rides in on a family match. Memoized in-process (the
+# catalog walk is ~100ms; every later lookup is a string match), and skippable via OSRC_FREE_CATALOG_CHECK=0.
+_OSRC_CAT_FREE_MEMO_SET=""; _OSRC_CAT_FREE_MEMO_DONE=""
+_devin_catalog_free_set() {
+  [ "${OSRC_FREE_CATALOG_CHECK:-1}" = "1" ] || { printf ' '; return; }
+  [ -n "$_OSRC_CAT_FREE_MEMO_DONE" ] && { printf '%s' "$_OSRC_CAT_FREE_MEMO_SET"; return; }
+  _OSRC_CAT_FREE_MEMO_DONE=1
+  local raw set=""
+  raw="$(_devin_catalog_raw 2>/dev/null)" || raw=""
+  if [ -n "$raw" ]; then
+    set="$(jq -r '
+      def canon(s): (s|ascii_downcase|sub("^[^/]*/";"")|sub("-(high|low|max|medium)$";"")|sub("-[0-9]{6,}$";"")|gsub("\\.";"-"));
+      def isfree(o): (((o.cost_tier // "") + " " + (o.cost_summary // ""))|test("free";"i"));
+      [ .families[]?
+        | ( select((.variants|length) > 0 and all(.variants[]?; isfree(.))) | (.family_uid, (.slug // empty)) ),
+          ( .variants[]? | select(isfree(.)) | .model_uid ) ]
+      | map(canon(.)) | unique | .[]
+    ' 2>/dev/null <<<"$raw" | tr "\n" " ")"
+  fi
+  _OSRC_CAT_FREE_MEMO_SET=" $set"
+  printf '%s' "$_OSRC_CAT_FREE_MEMO_SET"
+}
+
+# A launchable id for a truly-Free model (cost_tier=Free, no daily quota) discovered from the catalog —
+# the right escape-hatch to probe when the shared plan bucket is spent. Prefers a family id whose every
+# variant is Free (launchable bare, e.g. swe-2); empty when the catalog is unavailable.
+_devin_first_catalog_free_model() {
+  [ "${OSRC_FREE_CATALOG_CHECK:-1}" = "1" ] || { printf ''; return; }
+  local raw; raw="$(_devin_catalog_raw 2>/dev/null)" || raw=""
+  [ -n "$raw" ] || { printf ''; return; }
+  jq -r '
+    def isfree(o): (((o.cost_tier // "") + " " + (o.cost_summary // ""))|test("free";"i"));
+    [ .families[]? | select((.variants|length) > 0 and all(.variants[]?; isfree(.))) | .family_uid ]
+    | (first // empty)
+  ' 2>/dev/null <<<"$raw"
+}
+
 # _devin_resolve_dynamic <token> -> a launchable Devin variant resolved from the LIVE catalog, or
 # empty if unresolvable/offline. This is what lets a NEW or renamed Devin model work with no
 # hand-edited table: an exact variant id passes through; a family id or short alias (glm/deepseek/
@@ -1027,10 +1071,18 @@ _devin_resolve_dynamic() {
 # the shared glm/swe-1.7/kimi daily plan bucket). It was previously unrecognized, so a swe-2 dispatch —
 # the escape when the shared bucket is spent — was treated as a paid model.
 _devin_is_free_model() {
-  case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+  local t; t="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
+  # Static set = the plan-INCLUDED models Devin's catalog does NOT tag "Free" (it rates them by their
+  # non-plan pay-as-you-go price), so they can't be discovered from cost_tier and must be named here.
+  # Also the offline fallback for the catalog-Free models (so swe-2 is still recognized with no network).
+  case "$t" in
     glm|glm-5.2|glm-5-2|z-ai/glm-5.2|glm-5.3*|glm-5-3*|z-ai/glm-5.3*|swe-2|swe-2-high|swe-2-medium|swe-2-max|swe|swe-1.7|swe-1-7|swe-1.7-lightning|deepseek|deepseek-v4-pro|deepseek/deepseek-v4-pro|kimi|kimi-k3) return 0 ;;
-    *) return 1 ;;
   esac
+  # Catalog-driven union: any model the LIVE catalog marks cost_tier="Free" is free, so a newly added
+  # or renamed Free model is recognized with no code change — this is what stops the list from drifting.
+  local canon; canon="$(printf '%s' "$t" | sed -E 's#^[^/]*/##; s/-(high|low|max|medium)$//; s/-[0-9]{6,}$//; s/\./-/g')"
+  case "$(_devin_catalog_free_set)" in *" $canon "*) return 0 ;; esac
+  return 1
 }
 # The OpenRouter ALIAS a free Devin model also runs under (so the advertised fallback resolves to the
 # OpenRouter lane, not back to Devin). Empty when there is no OpenRouter sibling (SWE/Kimi are Devin-only).

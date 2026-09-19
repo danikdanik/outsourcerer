@@ -2,6 +2,12 @@
 
 All notable changes to the Outsourcerer plugin are documented here.
 
+## 0.13.3
+
+### Fixed
+
+- **The free-model list is now catalog-driven, so it can't drift behind Devin again.** Which models are free was a hardcoded list — that is exactly why `swe-2` was silently unrecognized until 0.13.2. Now any model Devin's own live catalog marks `cost_tier="Free"` is recognized as free with no code change, and the shared-quota escape probe targets a real Free model discovered from the catalog. The hardcoded set remains only as an offline fallback (no network / `OSRC_FREE_CATALOG_CHECK=0`). Cost-safe: a model family with any paid variant is never treated as free.
+
 ## 0.13.2
 
 ### Fixed
