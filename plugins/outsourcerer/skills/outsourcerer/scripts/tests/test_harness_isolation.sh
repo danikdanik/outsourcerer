@@ -155,6 +155,11 @@ EXTRACT="$TMPDIR_ISOL/funcs.sh"
   # "command not found" that looks exactly like the behaviour under test failing.
   awk '/^_mkdir_private\(\)/,/^}/' "$ENGINE"
   echo 'CC_MCP_FLAGS=()'
+  # build_mcp_flags_cc now derives the mcp= server set through _with_mcp_names (which uses _with_specs),
+  # so both dependencies must come across too — extracting the caller alone yields a "command not found"
+  # that looks exactly like the behaviour under test failing (rc=127).
+  awk '/^_with_specs\(\)/,/^}/' "$ENGINE"
+  awk '/^_with_mcp_names\(\)/,/^}/' "$ENGINE"
   # Extract build_mcp_flags_cc (from the comment block before the function through the closing brace)
   awk '/^# build_mcp_flags_cc/,/^}$/' "$ENGINE" | grep -v '^#'
   awk '/^# _emit_empty_mcp_cfg/,/^}$/' "$ENGINE" | grep -v '^#'

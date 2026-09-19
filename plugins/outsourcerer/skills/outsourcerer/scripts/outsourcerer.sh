@@ -4456,6 +4456,31 @@ $out"
   return 0
 }
 
+# _with_mcp_names -> the mcp= grants from WITH_SPEC as a comma-joined, trimmed, first-seen-deduped
+# list (repeated --with mcp= flags all count). A standalone function, NOT inline in build_mcp_flags_cc:
+# the dedup needs a `case`/while, and bash 3.2 (macOS) mis-parses a `case` pattern's `)` when it sits
+# inside a $( ) command substitution. Here `case` lives in a function body, which parses fine, and the
+# here-strings avoid nested heredocs. The presence check in build_mcp_flags_cc still verifies each name.
+# (Defined BEFORE build_mcp_flags_cc's doc-comment so a comment-to-brace source extraction of that
+# function does not stop early on this function's closing brace.)
+_with_mcp_names() {
+  local sp val part seen=" " out="" specs names
+  specs="$(_with_specs)"
+  while IFS= read -r sp; do
+    [ "${sp#mcp=}" != "$sp" ] || continue
+    val="${sp#mcp=}"
+    names="$(printf '%s' "$val" | tr ',' '\n')"
+    while IFS= read -r part; do
+      part="${part#"${part%%[![:space:]]*}"}"; part="${part%"${part##*[![:space:]]}"}"
+      [ -n "$part" ] || continue
+      case "$seen" in *" $part "*) continue ;; esac
+      seen="$seen$part "
+      out="$out$part,"
+    done <<< "$names"
+  done <<< "$specs"
+  printf '%s' "${out%,}"
+}
+
 # build_mcp_flags_cc -> populates the global array CC_MCP_FLAGS with claude --strict-mcp-config /
 # --mcp-config <path> args so a headless `claude -p` delegate does NOT inherit the user's live
 # ~/.claude.json MCP surface (project-scoped servers, which can wedge a sandboxed, non-interactive
@@ -4481,29 +4506,6 @@ $out"
 # The temp config is secret-bearing: created with umask 077 + chmod 600 and removed on script exit
 # (the EXIT trap at line ~104 already targets the with-mcp-$$.json name).
 CC_MCP_FLAGS=()
-
-# _with_mcp_names -> the mcp= grants from WITH_SPEC as a comma-joined, trimmed, first-seen-deduped
-# list (repeated --with mcp= flags all count). A standalone function, NOT inline in build_mcp_flags_cc:
-# the dedup needs a `case`/while, and bash 3.2 (macOS) mis-parses a `case` pattern's `)` when it sits
-# inside a $( ) command substitution. Here `case` lives in a function body, which parses fine, and the
-# here-strings avoid nested heredocs. The presence check in build_mcp_flags_cc still verifies each name.
-_with_mcp_names() {
-  local sp val part seen=" " out="" specs names
-  specs="$(_with_specs)"
-  while IFS= read -r sp; do
-    [ "${sp#mcp=}" != "$sp" ] || continue
-    val="${sp#mcp=}"
-    names="$(printf '%s' "$val" | tr ',' '\n')"
-    while IFS= read -r part; do
-      part="${part#"${part%%[![:space:]]*}"}"; part="${part%"${part##*[![:space:]]}"}"
-      [ -n "$part" ] || continue
-      case "$seen" in *" $part "*) continue ;; esac
-      seen="$seen$part "
-      out="$out$part,"
-    done <<< "$names"
-  done <<< "$specs"
-  printf '%s' "${out%,}"
-}
 
 build_mcp_flags_cc() {
   CC_MCP_FLAGS=()
