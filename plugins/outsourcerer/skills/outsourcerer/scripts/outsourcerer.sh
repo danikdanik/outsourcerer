@@ -147,7 +147,7 @@ set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 # Version identifier. Single source of truth; bump the rightmost
 # number for patch releases. `doctor` and `--version` both read this.
-OSRC_VERSION="0.13.3"
+OSRC_VERSION="0.13.4"
 DEFAULT_MODEL="${OUTSOURCERER_MODEL:-glm-5.2}"
 
 # ---- platform detection (mac | linux | windows-gitbash). Windows = Git Bash / MSYS2, NO WSL
@@ -4028,30 +4028,11 @@ _words_noglob() {
   WORDS=("$@")
 }
 
-_validate_with_token() {
-  local tok n=0 cur=""
-  # A literal control character in the spec is never legitimate - names use spaces, every
-  # transport here is line-oriented (a newline inside a name splits it into two fake entries),
-  # and the tokenizer itself splits on TAB, silently turning one name into two fragments.
-  case "${1:-}" in *[[:cntrl:]]*) die "--with: control characters (CR/LF/TAB) are not allowed in a spec - names may contain spaces, never control characters" ;; esac
-  local IFS=$' \t\n'
-  _words_noglob "${1:-}"
-  for tok in ${WORDS[@]+"${WORDS[@]}"}; do
-    n=$((n + 1))
-    case "$tok" in
-      skills=*|mcp=*) cur="$tok" ;;
-      *) # A non-spec token is legal ONLY as the continuation of a spaced skill name
-         # (skills=space ünicode). Before any spec it is the old silent-drop footgun.
-         [ -n "$cur" ] || die "--with requires e.g. skills=a,b or mcp=x (got '$tok'); an unrecognized spec is rejected rather than silently dropped"
-         cur="$cur $tok" ;;
-    esac
-  done
-  # A whitespace-only spec is non-empty (the parse-site die does not fire) but splits to nothing,
-  # which is the same silent no-op this validator exists to make loud.
-  [ "$n" -gt 0 ] || die "--with requires e.g. skills=a,b or mcp=x (got a whitespace-only spec); an unrecognized spec is rejected rather than silently dropped"
-  # Validate the assembled spec's value: non-empty, and every comma-separated name a safe single
-  # path component (spaces/unicode fine; traversal and glob metacharacters refused).
-  local val name badname=""
+# Validate ONE assembled spec's value ("skills=a,b c" / "mcp=x"): non-empty, and every comma-separated
+# name a safe single path component (spaces/unicode fine; traversal and glob metacharacters refused).
+# Factored out so EVERY spec in a multi-spec --with is checked, not just the last (see the caller).
+_validate_one_with_spec() {
+  local cur="${1:-}" val name badname=""
   val="${cur#*=}"
   [ -n "${val//[[:space:]]/}" ] || die "--with requires a non-empty value (got '$cur'); an empty grant is a silent no-op"
   # Malformed list syntax FAILS, never repairs: an empty member names nothing, and silently
@@ -4073,6 +4054,34 @@ _validate_with_token() {
 $(printf '%s' "$val" | tr ',' '\n')
 _OSRC_WITH_NAMES
   [ -z "$badname" ] || die "--with: invalid name '$badname' in '$cur' (names may contain spaces and unicode, but not / \\ * ? [ = , and never . or ..)"
+}
+
+_validate_with_token() {
+  local tok n=0 cur=""
+  # A literal control character in the spec is never legitimate - names use spaces, every
+  # transport here is line-oriented (a newline inside a name splits it into two fake entries),
+  # and the tokenizer itself splits on TAB, silently turning one name into two fragments.
+  case "${1:-}" in *[[:cntrl:]]*) die "--with: control characters (CR/LF/TAB) are not allowed in a spec - names may contain spaces, never control characters" ;; esac
+  local IFS=$' \t\n'
+  _words_noglob "${1:-}"
+  for tok in ${WORDS[@]+"${WORDS[@]}"}; do
+    n=$((n + 1))
+    case "$tok" in
+      skills=*|mcp=*)
+        # A new spec opens: validate the one just completed BEFORE overwriting it, or every spec but
+        # the last would sail through unchecked (H1 - a malformed non-final grant was silently repaired).
+        [ -n "$cur" ] && _validate_one_with_spec "$cur"
+        cur="$tok" ;;
+      *) # A non-spec token is legal ONLY as the continuation of a spaced skill name
+         # (skills=space ünicode). Before any spec it is the old silent-drop footgun.
+         [ -n "$cur" ] || die "--with requires e.g. skills=a,b or mcp=x (got '$tok'); an unrecognized spec is rejected rather than silently dropped"
+         cur="$cur $tok" ;;
+    esac
+  done
+  # A whitespace-only spec is non-empty (the parse-site die does not fire) but splits to nothing,
+  # which is the same silent no-op this validator exists to make loud.
+  [ "$n" -gt 0 ] || die "--with requires e.g. skills=a,b or mcp=x (got a whitespace-only spec); an unrecognized spec is rejected rather than silently dropped"
+  _validate_one_with_spec "$cur"   # the final spec
 }
 
 # build_with_preamble [transport] -> echoes the capability block for WITH_SPEC, or nothing.
@@ -4455,6 +4464,30 @@ $out"
 # The temp config is secret-bearing: created with umask 077 + chmod 600 and removed on script exit
 # (the EXIT trap at line ~104 already targets the with-mcp-$$.json name).
 CC_MCP_FLAGS=()
+
+# _with_mcp_names -> the mcp= grants from WITH_SPEC as a comma-joined, trimmed, first-seen-deduped
+# list (repeated --with mcp= flags all count). A standalone function, NOT inline in build_mcp_flags_cc:
+# the dedup needs a `case`/while, and bash 3.2 (macOS) mis-parses a `case` pattern's `)` when it sits
+# inside a $( ) command substitution. Here `case` lives in a function body, which parses fine, and the
+# here-strings avoid nested heredocs. The presence check in build_mcp_flags_cc still verifies each name.
+_with_mcp_names() {
+  local sp val part seen=" " out="" specs names
+  specs="$(_with_specs)"
+  while IFS= read -r sp; do
+    [ "${sp#mcp=}" != "$sp" ] || continue
+    val="${sp#mcp=}"
+    names="$(printf '%s' "$val" | tr ',' '\n')"
+    while IFS= read -r part; do
+      part="${part#"${part%%[![:space:]]*}"}"; part="${part%"${part##*[![:space:]]}"}"
+      [ -n "$part" ] || continue
+      case "$seen" in *" $part "*) continue ;; esac
+      seen="$seen$part "
+      out="$out$part,"
+    done <<< "$names"
+  done <<< "$specs"
+  printf '%s' "${out%,}"
+}
+
 build_mcp_flags_cc() {
   CC_MCP_FLAGS=()
   # Escape hatch: opt out of isolation, ride the full live MCP surface (interactive-style).
@@ -4466,21 +4499,11 @@ build_mcp_flags_cc() {
   # server that is absent from ~/.claude.json used to produce an empty-but-valid config and rc=0:
   # the delegate launched WITHOUT the granted capability and nobody was told. Fail BEFORE launch.
   local mspec=""
-  if [ -n "${WITH_SPEC:-}" ]; then
-    # EVERY mcp= spec counts: repeated flags (_consume_flags appends, so --with mcp=a --with mcp=b
-    # arrives as two specs) grant BOTH servers. Joining all specs into one comma-separated set and
-    # letting the presence check below verify every requested server fixes the old tail -1, which
-    # silently dropped every earlier granted server while reporting rc=0.
-    mspec="$(_with_specs | while IFS= read -r _sp; do case "$_sp" in mcp=*) printf '%s,' "${_sp#mcp=}" ;; esac; done)"
-    # normalize: trim each comma-separated name (a spaced list like mcp=a, b must match exactly),
-    # deduping first-seen (exact spelling preserved).
-    [ -n "$mspec" ] && mspec="$(printf '%s' "$mspec" | tr ',' '\n' | while IFS= read -r _n; do
-      _n="${_n#"${_n%%[![:space:]]*}"}"; _n="${_n%"${_n##*[![:space:]]}"}"
-      [ -n "$_n" ] || continue
-      case ",${_seen:-}," in *",$_n,"*) continue ;; esac
-      _seen="${_seen:-}$_n,"; printf '%s,' "$_n"
-    done)" && mspec="${mspec%,}"
-  fi
+  # EVERY mcp= grant counts (repeated --with mcp= flags arrive as multiple specs), comma-joined,
+  # trimmed, and deduped first-seen. Done in _with_mcp_names, NOT inline here, because that logic
+  # needs a `case`/while and bash 3.2 (macOS) mis-parses a `case`'s `)` inside a $( ) command
+  # substitution — the presence check below still verifies every requested server resolves.
+  [ -n "${WITH_SPEC:-}" ] && mspec="$(_with_mcp_names)"
   if [ -n "$mspec" ]; then
     have jq || { echo "ERROR: --with mcp=$mspec needs jq to build the filtered strict config; refusing to launch with the MCP grant silently absent." >&2; return 1; }
     local cj="$HOME/.claude.json"

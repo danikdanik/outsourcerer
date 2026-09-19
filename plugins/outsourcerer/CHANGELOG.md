@@ -2,6 +2,16 @@
 
 All notable changes to the Outsourcerer plugin are documented here.
 
+## 0.13.4
+
+### Added
+
+- **`--with skills=x` now transfers each granted skill's whole directory across every delegate lane** (SKILL.md plus `references/`, `scripts/`, `assets/`), staged per dispatch with a manifest, so a granted capability actually arrives at the delegate or the dispatch refuses — no more silent "ran without the skill it was told to use." Repeated `--with mcp=` specs combine instead of last-one-wins, and `--with skills=all` grants every resolvable skill.
+
+### Fixed
+
+- **Every grant spec in a combined `--with` is now validated, not just the last one.** A malformed or empty non-final spec (e.g. `--with "skills=recall, mcp=whatsapp"`) used to slip through and silently drop the empty member — honoring a different grant than the one written. It now fails loudly at validation, closing the gap this feature exists to prevent.
+
 ## 0.13.3
 
 ### Fixed

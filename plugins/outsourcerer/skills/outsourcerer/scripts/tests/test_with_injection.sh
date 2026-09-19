@@ -36,6 +36,14 @@ type -t _validate_with_token >/dev/null || { echo "FAIL: _validate_with_token no
 ( _validate_with_token "mcp=x" )     >/dev/null 2>&1 && ok "mcp= spec accepted"     || bad "mcp= spec wrongly rejected"
 ( _validate_with_token "/tmp/brief.txt" ) >/dev/null 2>&1 && bad "a bare file path was accepted (silent no-op returns)" || ok "a bare file path is rejected, not silently dropped"
 ( _validate_with_token "attach=/tmp/brief.txt" ) >/dev/null 2>&1 && bad "an unknown form= spec was accepted" || ok "an unrecognized form= spec is rejected"
+
+# H1 (CE review): in a MULTI-spec --with, EVERY spec is value-checked, not just the last. A malformed
+# or empty NON-final grant must fail, or it is silently repaired (an empty member dropped) — honoring a
+# different grant than the one written, the exact class this validator exists to eliminate.
+( _validate_with_token "skills=,bad mcp=ok" ) >/dev/null 2>&1 && bad "H1: malformed non-final spec (skills=,bad) was accepted" || ok "H1: malformed non-final spec fails"
+( _validate_with_token "skills= mcp=x" )      >/dev/null 2>&1 && bad "H1: empty non-final spec (skills=) was accepted"      || ok "H1: empty non-final spec fails"
+( _validate_with_token "skills=a, mcp=x" )    >/dev/null 2>&1 && bad "H1: trailing-comma non-final spec was accepted"        || ok "H1: trailing-comma non-final spec fails"
+( _validate_with_token "skills=recall mcp=whatsapp" ) >/dev/null 2>&1 && ok "H1: a valid combined spec still passes" || bad "H1: a valid combined spec was wrongly rejected"
 # The rejection message must name the spec and point at the valid forms, so the caller can fix it.
 _werr="$( ( _validate_with_token "/tmp/brief.txt" ) 2>&1 >/dev/null )"
 case "$_werr" in *"skills=a,b"*"mcp=x"*"/tmp/brief.txt"*) ok "the rejection names the spec and the valid forms" ;;
