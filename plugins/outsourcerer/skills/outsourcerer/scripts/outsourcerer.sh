@@ -9945,6 +9945,9 @@ _kill_job() {
 # detector's own pattern line back into its log. A watchdog whose source is its own trip-wire kills
 # whoever works on it.
 _printmode_needle() { printf 'chisel::repl::handler: Print mode: %s tool %s that requires confirmation' 'rejecting' 'exec'; }
+# Newer devin CLIs (observed on 3000.11) no longer hang on that reject: they print this warning to
+# stderr, end the session, and exit 0. Assembled at runtime for the same self-match reason as above.
+_noninteractive_reject_needle() { printf 'warning: %s a tool call that requires confirmation. Running in %s mode' 'rejected' 'non-interactive'; }
 _perm_needles() {
   printf '(%s|%s|%s)' \
     "requested permis""sions to" \
@@ -10443,6 +10446,22 @@ _supervise() {
       printf '%s\n' "$_btxt" > "$jd/reason" 2>/dev/null || true
       return 3 ;;
   esac
+  # DEVIN NON-INTERACTIVE REJECT (post-exit). A current devin CLI that rejects a tool call needing
+  # confirmation prints _noninteractive_reject_needle, ends the session and exits 0, so without this
+  # the job reads as `done?` and nothing says the delegate stopped before its remaining steps (usually
+  # the verification run). That is the permission-blocked state. Same anchoring as the print-mode
+  # check: tail only, devin lane only (another lane quoting the line is not devin stopping), and a
+  # delegate that went on to sign OSRC::DONE is taken at its word.
+  local _jlane=""; [ -f "$jd/meta.json" ] && have jq && _jlane="$(jq -r '(.lane // .provider // "")' "$jd/meta.json" 2>/dev/null)"
+  if [ "$last" != "OSRC::DONE" ] && [ "${OSRC_NO_PRINTMODE_ABORT:-0}" != "1" ] \
+     && { [ "$_jlane" = "dv" ] || [ "$_jlane" = "devin" ]; } \
+     && tail -n "${OSRC_PRINTMODE_TAIL:-25}" "$jd/out.log" 2>/dev/null | grep -aqF "$(_noninteractive_reject_needle)"; then
+    echo "permission-blocked" > "$jd/status"
+    printf 'permission-blocked:noninteractive-reject\n' > "$jd/reason" 2>/dev/null || true
+    echo "[outsourcerer] job $(basename "$jd"): devin rejected a tool call that needs confirmation and ended the run (non-interactive mode). Work before that point may have landed; the step it was attempting did not run. Run that step yourself, re-run with 'yolo', or use 'session' when the delegate must run tests." >&2
+    echo 3 > "$jd/exit"
+    return 3
+  fi
   # Output-token exhaustion is a distinct, recoverable failure, but engines report it as a generic
   # non-zero exit with the partial answer still sitting in the log. Left unnamed it reads as "the run
   # broke"; the operator keeps the truncated output and never learns the result was cut, not wrong.
@@ -19587,6 +19606,14 @@ main() {
   # bg/fanout launch with "route preflight returned non-zero" — the tool refusing to start the very
   # work that would clear the backlog. Preflight returns its own dispatch rc untouched.
   if [ "${OSRC_PREFLIGHT:-0}" = "1" ]; then
+    return "$_cmd_rc"
+  fi
+  # Same for the child a supervised job runs (run_job re-enters this script as `<verb> ...` under
+  # _supervise with OSRC_JOB_DIR set). That child IS the delegated work, not an orchestrator turn
+  # ending, and _supervise reads its exit code as the delegate's. Running the guard here let a
+  # finished delegate exit 7 whenever unrelated fleet state needed attention, so a job with a
+  # complete deliverable was recorded as failed with reason exit-nonzero:rc=7.
+  if [ -n "${OSRC_JOB_DIR:-}" ]; then
     return "$_cmd_rc"
   fi
   case "$cmd" in
