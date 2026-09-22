@@ -58,6 +58,9 @@ distinct handling:
   and aborts fast instead of waiting out the 15-min stall-kill. Next step: re-run with `yolo`
   (bypassPermissions) or restructure the prompt so the delegate ENDS on a file write and the orchestrator
   does the validation/commit/PR. Opt out with `OSRC_NO_PRINTMODE_ABORT=1` (the stall-kill still backstops).
+  A devin `edit` prompt now says this up front: edits first, no test/build commands, end with the
+  verification commands to run. Use `session` when the delegate itself must run tests.
+  `OSRC_DEVIN_EDIT_NOTE=0` drops the note.
 - **`launching` that never reaches `running` → `failed` (stillborn).** The launcher detached but the
   worker never wrote a process/log within the grace window (`OSRC_LAUNCH_GRACE`, default 45s) — usually a
   sandbox that reaps detached background jobs (e.g. running inside another agent's exec sandbox). `status`
