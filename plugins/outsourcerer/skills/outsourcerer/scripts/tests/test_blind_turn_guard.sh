@@ -149,7 +149,6 @@ out="$(CLAUDE_CODE_SESSION_ID=some-other-sess _blind_turn_guard 2>&1)"; rc=$?
   && ok "a different session with the same state is still reported" \
   || bad "a non-caller stuck peer was not reported (rc=$rc)"
 peer_ancestor_stuck='{"owner":"cc-peer","job_id":null,"session_id":"ancestor-sess","pid":'"$$"',"state":"unresponsive?","state_label":"Maybe stuck","waiting_for":null,"display_name":"orchestrator","cwd":"/repo"}'
-write_snapshot "$(snapshot_with "$peer_ancestor_stuck")"
 peer_self_waiting='{"owner":"cc-peer","job_id":null,"session_id":"caller-sess","pid":'"$far_pid"',"state":"blocked?","state_label":"Waiting on you","waiting_for":"approval","display_name":"orchestrator","cwd":"/repo"}'
 write_snapshot "$(snapshot_with "$peer_self_waiting" "$managed_blocked")"
 out="$(CLAUDE_CODE_SESSION_ID=caller-sess _blind_turn_guard 2>&1)"; rc=$?
