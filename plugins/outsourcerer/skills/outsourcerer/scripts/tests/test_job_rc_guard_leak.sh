@@ -19,10 +19,11 @@ FIXTURE="$(mktemp -d "$PWD/.test-rc-guard.XXXXXX")"
 trap 'rm -rf "$FIXTURE"' EXIT
 export OSRC_HOME="$FIXTURE/home"
 mkdir -p "$OSRC_HOME"
-# Job-child env must not leak into this harness: run_job exports OSRC_JOB_DIR/OSRC_STREAM into the
-# child it supervises, so a suite run INSIDE a job would otherwise leave the "is this a job child"
-# calls below ambiguous (and write captures into a foreign job dir).
-unset OSRC_JOB_DIR OSRC_STREAM
+# Job-child env must not leak into this harness: run_job exports OSRC_JOB_DIR/OSRC_STREAM (and
+# OUTSOURCERER_PROVIDER) into the child it supervises, so a suite run INSIDE a job would otherwise
+# leave the "is this a job child" calls below ambiguous, write captures into a foreign job dir, and
+# feed the provider-env lane fallback.
+unset OSRC_JOB_DIR OSRC_STREAM OUTSOURCERER_PROVIDER
 
 pass=0; fail=0
 ok()  { echo "PASS: $1"; pass=$((pass+1)); }
@@ -76,7 +77,7 @@ out="$(child "$FIX/readonly-review.delegate.txt" 0 2>&1)"; rc=$?
 # --- the env var ALONE must not exempt a run: run_job exports OSRC_JOB_DIR into the job child's
 # environment, so a delegate that runs outsourcerer itself inherits it; if env were the signal,
 # every nested call would run blind. Only the private argv sentinel exempts. ---
-out="$(OSRC_JOB_DIR="$FIXTURE/inherited-job" child "$FIX/readonly-review.delegate.txt" 0 2>&1)"; rc=$?
+out="$(OSRC_JOB_DIR="$FIXTURE/inherited-job" OSRC_STREAM=1 child "$FIX/readonly-review.delegate.txt" 0 2>&1)"; rc=$?
 [ "$rc" = 7 ] && printf '%s' "$out" | grep -q 'blind-turn guard' \
   && ok "an inherited OSRC_JOB_DIR without the sentinel still gets the guard's rc=7" \
   || bad "inherited OSRC_JOB_DIR disabled the guard (rc=$rc)"
@@ -155,6 +156,12 @@ OUTSOURCERER_PROVIDER=devin OSRC_POLL=1 _supervise "$jd" 30 60 120 -- cat "$FIX/
 [ "$(cat "$jd/status")" = "permission-blocked" ] \
   && ok "missing meta.json: the provider env still maps the reject" \
   || bad "missing meta.json gave status $(cat "$jd/status")"
+jd="$OSRC_JOBS/nometacc"; mkdir -p -m 700 "$jd"
+: > "$jd/.startmark"; : > "$jd/.fsmark"
+OUTSOURCERER_PROVIDER=cc OSRC_POLL=1 _supervise "$jd" 30 60 120 -- cat "$FIX/edit-reject.delegate.txt" >/dev/null 2>&1
+[ "$(cat "$jd/status")" = "done?" ] \
+  && ok "missing meta.json + a non-devin provider does not map" \
+  || bad "non-devin provider env mapped the reject: $(cat "$jd/status")"
 
 # --- the observed reject is an exit-0 stop; a nonzero devin exit keeps its real code (and the
 # exit-nonzero reason), not a rewritten 3 ---
