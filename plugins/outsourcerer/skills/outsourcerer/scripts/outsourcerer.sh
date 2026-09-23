@@ -10449,11 +10449,15 @@ _supervise() {
   # DEVIN NON-INTERACTIVE REJECT (post-exit). A current devin CLI that rejects a tool call needing
   # confirmation prints _noninteractive_reject_needle, ends the session and exits 0, so without this
   # the job reads as `done?` and nothing says the delegate stopped before its remaining steps (usually
-  # the verification run). That is the permission-blocked state. Same anchoring as the print-mode
-  # check: tail only, devin lane only (another lane quoting the line is not devin stopping), and a
-  # delegate that went on to sign OSRC::DONE is taken at its word.
+  # the verification run). That is the permission-blocked state. Anchoring mirrors the print-mode
+  # check: tail only, devin lane only (another lane quoting the line is not devin stopping), exit-0
+  # only (a nonzero child keeps its real code on the exit-nonzero path below), and a delegate that
+  # went on to sign OSRC::DONE is taken at its word. The lane comes from meta.json when it exists;
+  # meta.json is jq-written, so without jq it is absent -- fall back to the provider env run_job
+  # exports or the mapping silently never fires.
   local _jlane=""; [ -f "$jd/meta.json" ] && have jq && _jlane="$(jq -r '(.lane // .provider // "")' "$jd/meta.json" 2>/dev/null)"
-  if [ "$last" != "OSRC::DONE" ] && [ "${OSRC_NO_PRINTMODE_ABORT:-0}" != "1" ] \
+  _jlane="${_jlane:-${OUTSOURCERER_PROVIDER:-}}"
+  if [ "$rc" -eq 0 ] && [ "$last" != "OSRC::DONE" ] && [ "${OSRC_NO_PRINTMODE_ABORT:-0}" != "1" ] \
      && { [ "$_jlane" = "dv" ] || [ "$_jlane" = "devin" ]; } \
      && tail -n "${OSRC_PRINTMODE_TAIL:-25}" "$jd/out.log" 2>/dev/null | grep -aqF "$(_noninteractive_reject_needle)"; then
     echo "permission-blocked" > "$jd/status"
@@ -11243,7 +11247,7 @@ run_job() {
   [ "${PROVIDER_EXPLICIT:-0}" = "1" ] && _run_provider=(--provider "$prov")
   OSRC_STREAM=1 OSRC_JOB_DIR="$jd" OUTSOURCERER_PROVIDER="$prov" OSRC_PROVIDER_EXPLICIT="${PROVIDER_EXPLICIT:-0}" OSRC_JOB_VERB="$verb" \
     _supervise "$jd" "$warn" "$kill" "$hard" -- \
-    "$SCRIPT_PATH" ${_run_provider[@]+"${_run_provider[@]}"} "$verb" "$@"
+    "$SCRIPT_PATH" --osrc-job-child-internal ${_run_provider[@]+"${_run_provider[@]}"} "$verb" "$@"
   local sc=$?
   # Worktree receipt: record base/head SHA + dirty/ahead so the orchestrator can inspect or integrate
   # deterministically. NEVER auto-remove — the worktree is preserved until an explicit `cleanup`.
@@ -19491,6 +19495,14 @@ main() {
   # inspection below so the sentinel is consumed and the real subcommand lands in $1.
   unset OSRC_PREFLIGHT
   if [ "${1:-}" = "--osrc-preflight-internal" ]; then OSRC_PREFLIGHT=1; shift; fi
+  # Same class, same defense: the supervised job child is exempt from the blind-turn guard (see
+  # below), and that exemption must travel in argv, not env. OSRC_JOB_DIR is functional state the
+  # child legitimately reads (capture dirs) AND it is inheritable -- run_job exports it into the
+  # child, so a delegate that runs outsourcerer itself would see its guard silently disabled; and
+  # delegate_codex's own error text tells users to export it, which would switch the guard off for
+  # every run they launch after. A private argv sentinel cannot leak through the environment.
+  local _job_child=0
+  if [ "${1:-}" = "--osrc-job-child-internal" ]; then _job_child=1; shift; fi
   # Surface neglected jobs on EVERY invocation. The orchestrator forgetting to watch is the observed
   # failure, so the reminder has to come from the tool at the moment of next contact, not from a rule
   # someone has to remember mid-session. Suppressed inside a detached job (it IS the work) and for the
@@ -19609,11 +19621,12 @@ main() {
     return "$_cmd_rc"
   fi
   # Same for the child a supervised job runs (run_job re-enters this script as `<verb> ...` under
-  # _supervise with OSRC_JOB_DIR set). That child IS the delegated work, not an orchestrator turn
-  # ending, and _supervise reads its exit code as the delegate's. Running the guard here let a
-  # finished delegate exit 7 whenever unrelated fleet state needed attention, so a job with a
-  # complete deliverable was recorded as failed with reason exit-nonzero:rc=7.
-  if [ -n "${OSRC_JOB_DIR:-}" ]; then
+  # _supervise, flagged by the --osrc-job-child-internal sentinel consumed above). That child IS
+  # the delegated work, not an orchestrator turn ending, and _supervise reads its exit code as the
+  # delegate's. Running the guard here let a finished delegate exit 7 whenever unrelated fleet
+  # state needed attention, so a job with a complete deliverable was recorded as failed with
+  # reason exit-nonzero:rc=7.
+  if [ "$_job_child" = "1" ]; then
     return "$_cmd_rc"
   fi
   case "$cmd" in
